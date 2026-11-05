@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QQ 小鲸鱼 配置页 · 本地预览</title>
+    <style>
+      /*
+       * 这一层只在预览里存在：把 client.js 用的那几个设计 token 补上。
+       * 真页面里这些值由 DSH 的侧栏主题提供（它也带 fallback，缺了不会崩，只是颜色不对）。
+       */
+      :root {
+        --dsw-alias-text-primary: #1f2328;
+        --dsw-alias-text-secondary: #6b7280;
+        --dsw-alias-label-primary: #1f2328;
+        --dsw-alias-label-secondary: #4b5563;
+        --dsw-alias-label-tertiary: #9ca3af;
+        --dsw-alias-bg-primary: #ffffff;
+        --dsw-alias-border-secondary: #e5e7eb;
+        --dsw-alias-border-strong: #d1d5db;
+        --dsw-alias-accent-primary: #2563eb;
+        --dsw-alias-text-danger: #dc2626;
+        --dsw-alias-text-warning: #b45309;
+        --dsw-alias-text-success: #15803d;
+        --dsw-alias-interactive-bg-hover: #f3f4f6;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        display: flex;
+        flex-direction: column;
+        background: #f6f7f9;
+        color: #1f2328;
+        font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      }
+
+      /* 预览自己的说明条 —— 只在这里出现，真页面没有它。 */
+      #preview-bar {
+        flex: 0 0 auto;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px 14px;
+        padding: 8px 16px;
+        background: #fef3c7;
+        border-bottom: 1px solid #fcd34d;
+        font-size: 12px;
+        line-height: 1.5;
+        color: #78350f;
+      }
+
+      #preview-bar strong {
+        font-size: 13px;
+      }
+
+      #preview-bar .tag {
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: #fde68a;
+        font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+        font-size: 11px;
+      }
+
+      /*
+       * 挂载点必须有**确定高度**（client.js 的 styles.page 是 height:100% +
+       * 内容区自己滚）。给它 flex:1 + min-height:0，否则"超出范围没法滚"那个老毛病
+       * 会在预览里重现 —— 而那个毛病只在真渲染里看得出来。
+       */
+      #root {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: hidden;
+        background: #ffffff;
+      }
+
+      #boot-error {
+        display: none;
+        margin: 24px auto;
+        max-width: 720px;
+        padding: 16px 18px;
+        border: 1px solid #fca5a5;
+        border-radius: 8px;
+        background: #fef2f2;
+        color: #991b1b;
+        font-size: 14px;
+        line-height: 1.7;
+        white-space: pre-wrap;
+      }
+
+      #boot-error code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: #fee2e2;
+        font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="preview-bar">
+      <strong>本地预览</strong>
+      <span>页面是 <span class="tag">client.js</span> 真代码渲染的 · 数据是 <span class="tag">preview/fixtures.mjs</span> 的假数据</span>
+      <span>改完 client.js → 按 F5（不用重启 DSH）</span>
+      <span id="react-source">React：加载中…</span>
+    </div>
+
+    <div id="root"></div>
+    <div id="boot-error"></div>
+
+    <!--
+      ① 宿主的模块装载器。client.js 是**经典脚本**（没有 import/export），
+         它一加载就会调 `window.__ModuleLoader__.load({ id, factory })` 把自己注册进来。
+         这里只把 factory 接住，等 boot.mjs 再按宿主的方式调用它 —— 所以预览里跑的
+         是 client.js 的**原样代码**，不是复制品。
+    -->
+    <script>
+      window.__previewModules = [];
+      window.__ModuleLoader__ = {
+        load: function (entry) {
+          window.__previewModules.push(entry);
+        },
+      };
+    </script>
+
+    <!-- ② 真 React + 真 ReactDOM（UMD）。本机文件见 preview/vendor/，没有就 302 到 CDN。 -->
+    <script src="/react.development.js"></script>
+    <script src="/react-dom.development.js"></script>
+
+    <!-- ③ 被预览的那一份：上层的真 client.js（serve.mjs 把 /client.js 映射过去）。 -->
+    <script src="/client.js"></script>
+
+    <!-- ④ 真正去调 installer、取组件、挂载的，是这个模块。 -->
+    <script type="module" src="/boot.mjs"></script>
+  </body>
+</html>

@@ -1,0 +1,620 @@
+/*
+ * QQ 小鲸鱼配置页（独立网页）的样式。
+ *
+ * 设计约束：
+ * - 只使用系统字体与本地资源，不引用任何网络字体或图标，页面必须能离线使用；
+ * - 深浅两套主题共用一份规则，靠 CSS 变量切换；
+ * - 间距以 10px 为基本单位，控件高度以 30px 为基准。
+ *
+ * 这一份样式与 client.js 的内联样式表是**两份实现**：client.js 是宿主内的经典脚本，
+ * 拿不到 CSS 文件通道，只能写内联样式；本文件是独立网页，走正常的样式表。
+ * 视觉参数（字号、间距、断行宽度）刻意与 client.js 对齐，便于两处对照。
+ */
+
+:root {
+  color-scheme: light dark;
+  --page-bg: #f6f7f9;
+  --card-bg: #ffffff;
+  --text-primary: #1f2328;
+  --text-secondary: #6b7280;
+  --text-muted: #9ca3af;
+  --text-danger: #dc2626;
+  --text-warning: #b45309;
+  --text-success: #15803d;
+  --border-soft: rgba(128, 128, 128, 0.24);
+  --border-strong: rgba(128, 128, 128, 0.4);
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --hover-bg: rgba(128, 128, 128, 0.14);
+  --warn-bg: rgba(210, 153, 34, 0.1);
+  --warn-border: rgba(210, 153, 34, 0.5);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page-bg: #14161a;
+    --card-bg: #1b1e24;
+    --text-primary: #e8eaed;
+    --text-secondary: #a3a9b3;
+    --text-muted: #7f8791;
+    --text-danger: #f87171;
+    --text-warning: #fbbf24;
+    --text-success: #4ade80;
+    --border-soft: rgba(255, 255, 255, 0.14);
+    --border-strong: rgba(255, 255, 255, 0.26);
+    --accent: #60a5fa;
+    --accent-soft: rgba(96, 165, 250, 0.16);
+    --hover-bg: rgba(255, 255, 255, 0.1);
+    --warn-bg: rgba(251, 191, 36, 0.12);
+    --warn-border: rgba(251, 191, 36, 0.5);
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--text-primary);
+  font: 14px/1.6 system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 18px 20px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.app-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.service {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.service-error {
+  color: var(--text-danger);
+}
+
+.tabbar {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 0;
+}
+
+.tab {
+  padding: 7px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px 6px 0 0;
+}
+
+.tab:hover {
+  background: var(--hover-bg);
+}
+
+.tab[aria-pressed='true'] {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.card-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.hint-ok {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-success);
+}
+
+.hint-warn {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-warning);
+}
+
+.error {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-danger);
+  white-space: pre-wrap;
+}
+
+.banner {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--text-warning);
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.button {
+  min-height: 30px;
+  padding: 4px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--hover-bg);
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.button-primary {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.button-warning {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--text-warning);
+  font-weight: 600;
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn-border);
+  border-radius: 8px;
+  background: var(--warn-bg);
+}
+
+.confirm-text {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-warning);
+  white-space: pre-wrap;
+}
+
+/* ---------------- 二级标签（全局 / 私聊 / 各群） ---------------- */
+
+.subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.subtab {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.subtab:hover {
+  background: var(--hover-bg);
+}
+
+.subtab[aria-pressed='true'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.subtab-top,
+.subtab-only {
+  font-size: 13px;
+  line-height: 1.35;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.subtab-bottom {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pill-warn {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--warn-bg);
+  color: var(--text-warning);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+/* ---------------- 字段行 ---------------- */
+
+.field-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 9px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+/*
+ * 窄字段一行 2~3 个（2026-10-30）。
+ *
+ * 判据在 `logic.fieldCompact()`：数字 / 开关 / 下拉是窄的，文本与多行仍占整行。
+ * 用 auto-fill 而不是写死列数：窗口变窄时自己掉到 2 个、1 个，不用 JS 量宽度。
+ * 组内每条改成"标签在上、控件在下"的单列 —— 210px 里再切 140px 标签列就没地方放控件了。
+ */
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 2px 18px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.field-grid .field-row {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  border-top: 0;
+  padding: 5px 0;
+}
+
+.field-grid .field-label-box {
+  padding-top: 0;
+}
+
+/* 窄字段也保留 key，放在中文名下面另起一行（用户 2026-10-30 要求）：
+   一行三个的时候它仍要点出 toml 键名，否则改完不知道自己在改哪一项。 */
+.field-grid .field-key {
+  display: block;
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.field-row.first {
+  border-top: 0;
+  padding-top: 0;
+}
+
+/*
+ * 双击放大后的字段行：网格由两列改为一列，标签在上、输入框占下一行整宽。
+ * 保留 140px 标签列会让可编辑宽度白白少掉一列，而放大本来就是为了看清长文本。
+ */
+.field-row.zoomed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.field-label-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding-top: 2px;
+  min-width: 0;
+}
+
+.field-label {
+  font-size: 13px;
+  color: var(--text-primary);
+  /* 2026-10-30：中文名也可能长，别让它顶出 140px 那一列（以前的溢出来源之一）。 */
+  overflow-wrap: anywhere;
+}
+
+.field-key {
+  font-size: 10.5px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.field-control-box {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.field-error {
+  font-size: 11.5px;
+  color: var(--text-danger);
+  white-space: pre-wrap;
+}
+
+.input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 38px;
+  padding: 6px 8px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--text-primary);
+  resize: vertical;
+}
+
+/*
+ * 放大态：高度按内容放开（行数由 textareaZoomRows 计算），内容高于一屏时在框内滚动。
+ * 取 70vh 而不是 100vh，是为下方按钮行留出可见空间，否则放大后保存按钮会被推出视口。
+ */
+.textarea.zoomed {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/*
+ * 下拉候选：系统下拉面板的底色固定为白色，深色主题下若继续使用浅色文字，
+ * 候选项会看不见，因此显式指定白底黑字。只作用于 option：select 本身仍随主题取色。
+ */
+select option {
+  background: #ffffff;
+  color: #000000;
+}
+
+/* ---------------- 折叠条 ---------------- */
+
+.fold-bar {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fold-bar:hover:not(:disabled) {
+  background: var(--hover-bg);
+}
+
+/* ---------------- 底部保存条（整页唯一的保存入口） ---------------- */
+
+/*
+ * 贴在视口底边：`sticky` + `bottom: 0`，元素本身仍是 `.app` 的最后一个流内子元素，
+ * 所以滚到底时它会自然落在内容下方，不会有内容被永久盖住（`position: fixed`
+ * 就得靠 padding 补，补多了留白、补少了挡内容）。
+ *
+ * 负的左右外边距 + 等量内边距让它铺满整行（`.app` 有 20px 左右 padding），
+ * 负的下外边距抵消 `.app` 的 48px 底部内边距，滚到底时不会留一条缝。
+ *
+ * 背景必须是不透明的 `--card-bg`：它是浮在内容之上的，透明会看出两层字叠在一起。
+ */
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin: 0 -20px -48px;
+  padding: 10px 20px max(10px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border-strong);
+  background: var(--card-bg);
+  box-shadow: 0 -6px 16px rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 「保存全部」比次级按钮重一档：它是整页唯一的主操作。 */
+.save-bar .button-primary {
+  min-height: 34px;
+  padding: 6px 16px;
+  font-size: 13.5px;
+}
+
+/* ---------------- 重连覆盖层（重载后自动重连） ---------------- */
+
+/*
+ * 断开的这段时间里整页盖一层：`position: fixed; inset: 0` 铺满视口，z-index 高于
+ * 底部保存条（10），所以下面的输入框与按钮**都按不到** —— 断开期间不该再改配置。
+ *
+ * 刻意不做成"全黑遮罩 + 居中弹窗"：那是模态框的样子，会让人以为必须点掉它才能继续。
+ * 这里用一层很淡的雾，提示卡贴在**顶部**而不是正中，页面内容仍然看得见（"东西还在，
+ * 只是暂时连不上"），视线不会被吸到屏幕中央。
+ *
+ * 背景不用纯色而用 `backdrop-filter`：不支持时回落成半透明 —— 雾化失败也还是能读。
+ */
+.reconnect-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 56px 20px 20px;
+  overflow-y: auto;
+  background: rgba(128, 128, 128, 0.18);
+  backdrop-filter: blur(1.5px);
+  cursor: progress;
+}
+
+.reconnect-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(560px, 100%);
+  padding: 14px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--card-bg);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  cursor: default;
+}
+
+.reconnect-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/*
+ * 已等待秒数在这一行里，用等宽数字：每 1.5 秒跳一次，比例字体会让整行宽度跟着抖。
+ */
+.reconnect-detail {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
+/* 等待中的那条细进度条：只表达"还在动"，不假装知道进度百分比。 */
+.reconnect-overlay[data-phase='waiting'] .reconnect-card::after {
+  content: '';
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent) 50%,
+    transparent 100%
+  );
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: reconnect-sweep 1.5s linear infinite;
+}
+
+@keyframes reconnect-sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+
+/* 用户开了"减少动效"就只留提示文字，不要那条来回扫的光带。 */
+@media (prefers-reduced-motion: reduce) {
+  .reconnect-overlay[data-phase='waiting'] .reconnect-card::after {
+    animation: none;
+    background: var(--accent-soft);
+  }
+}
+
+/* 复制不进去时摊开的文本框：宽度跟卡片走，别把卡片撑破。 */
+.reconnect-dump {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ---------------- 启动失败提示 ---------------- */
+
+
+.boot-error {
+  max-width: 720px;
+  margin: 32px auto;
+  padding: 16px 18px;
+  border: 1px solid var(--text-danger);
+  border-radius: 8px;
+  background: var(--card-bg);
+  color: var(--text-danger);
+  font-size: 13.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.boot-error[hidden] {
+  display: none;
+}

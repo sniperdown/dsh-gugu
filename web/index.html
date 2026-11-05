@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  QQ 小鲸鱼配置页的 HTML 外壳。
+
+  这个文件由宿主临时配置服务在 `GET /?t=<令牌>` 时读出，并把其中所有
+  `__TOKEN__` 替换成本次会话的令牌后再送出。替换发生在服务端，原因有两个：
+
+  1. 静态资源（`/style.css`、`/vendor/*.js`、`/app.js`）与页面走同一道令牌校验，
+     `<link>` 与 `<script src>` 无法自定义请求头，只能把令牌拼进查询参数；
+  2. 令牌不进 HTML 的可见文本，也不落盘，只出现在资源地址里。
+
+  React 用仓库里已有的 UMD 构建（`preview/vendor/`），不引 CDN、不经过构建步骤，
+  因此断网也能打开。`app.js` 是 ES module，它再用带令牌的地址动态 import
+  `logic.mjs`（纯逻辑，见该文件头部说明）。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>QQ 小鲸鱼 · 配置页</title>
+    <link rel="stylesheet" href="/style.css?t=__TOKEN__" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="boot-error" class="boot-error" hidden></div>
+    <noscript>
+      <div class="boot-error">本页需要启用 JavaScript 才能读取和修改配置。</div>
+    </noscript>
+
+    <!-- 本地 UMD 构建：加载完成后暴露 window.React 与 window.ReactDOM。 -->
+    <script src="/vendor/react.development.js?t=__TOKEN__"></script>
+    <script src="/vendor/react-dom.development.js?t=__TOKEN__"></script>
+
+    <!-- 页面入口。模块脚本在 UMD 脚本之后执行，因此能直接取到两个全局。 -->
+    <script type="module" src="/app.js?t=__TOKEN__"></script>
+  </body>
+</html>

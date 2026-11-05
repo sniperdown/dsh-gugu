@@ -1,0 +1,42 @@
+{
+  "name": "dsh-qq-proactive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "给 DSH 加一个能自己开口的 QQ 通道：NapCat/OneBot 11，私聊与群聊各自独立持久会话，支持被动回复、群聊话题主动插话、工作完成汇报。",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node tools/run-all-tests.mjs",
+    "test:isolated": "node --test --test-force-exit \"test/*.test.mjs\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "src",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "comment": {
+    "test": "`npm test` 复用 tools/run-all-tests.mjs：它自己去 readdir 扫 test/*.test.mjs，所以**天然覆盖全部测试文件**，不会像以前那样因为手写枚举而漏掉一批（2026-10-07 那次漏了 16 个）。它还有一个好处：`node --test` 要为每个文件 spawn 子进程，受限沙箱里会 spawn EPERM，产生「每个文件正好 1 个 fail」的假红；run-all-tests.mjs 在单进程里串行 import，沙箱里照样跑对。（原来的 `test:sandbox` 就是它，现在 `test` 已经是沙箱安全的，那个别名已删。）",
+    "test:isolated": "逐文件独立进程跑（`node --test` + glob，Node >= 22 自己展开 glob）。⚠️ **受限沙箱里会 EPERM 假红**，那时请用 `npm test`。留着它是为了 `run-all-tests.mjs` 注释里说的那个退路：万一将来出现「跨文件互相影响」的测试，单进程模式跑不通，就得用它。非沙箱环境实测正常。",
+    "peerDependencies": "刻意留空。任何一条 @deepseek-ai/dsh* 的范围不匹配都会让宿主静默 disable 这一行；而运行时本来就会把插件 import 的包重定向到宿主安装树的同一实例，所以声明它们只有坏处。",
+    "no-build-step": "exports 直接指向 src/ 下的 .mjs 与 client.js：宿主是按 exports 里的字符串拼绝对路径读文件的，所以不需要构建产物，插件因此零依赖、零构建。",
+    "inject-list": "模块级 inject 只放必需服务（agents/timer/agentDefaultModel）。connection 与 webServer 是可选服务，必须走 ctx.inject 条件加载——写进模块级 inject 会让纯 headless 部署里整个插件挂起不激活。"
+  }
+}

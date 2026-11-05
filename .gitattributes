@@ -1,0 +1,10 @@
+# 统一换行：仓库里一律 LF（Windows 检出时 git 自己转）
+* text=auto eol=lf
+
+# 二进制：不要当文本处理
+*.png binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.woff binary
+*.woff2 binary

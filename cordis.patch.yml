@@ -1,0 +1,19 @@
+# qq-proactive 的 bundle patch。
+#
+# 声明在 package.json 的 dsh.bundle.patch 里。宿主读取点在
+# dsh-app-boot/lib/index.js 的 loadProfileDirectory：读 dsh.bundle，
+# 用 bundlePatchPaths 拼绝对路径，再 loadOverlayPatches 解析。
+#
+# 本文件必须保持「顶层 YAML 数组」形态，且**不能为空文件或只有注释**——
+# 那会让启动失败。没有条目时要写成 `[]`。
+
+- insert:
+    - id: qq-proactive
+      name: 'dsh-qq-proactive'
+      # config:
+      #   mode: reverse
+      #   accessToken: '与 NapCat 侧一致'
+      #   adminUsers: ['你的QQ号']
+      #   groupAllowFrom: ['目标群号']
+      #   groupPolicy: admin
+      #   proactive: { enabled: true }

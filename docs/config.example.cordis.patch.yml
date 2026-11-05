@@ -1,0 +1,91 @@
+# ============================================================================
+# 示例：把 dsh-qq-proactive 挂进 DSH profile 的 cordis.patch.yml
+#
+# ⚠️ 这是**脱敏示例**，不是能直接跑的文件：
+#    - 所有 QQ 号 / 群号 / token 都写成了 <占位符>，照着填你自己的；
+#    - 它是「该长什么样」的样板，合并方式见下面的「怎么用」。
+#
+# 真正的文件在：<DSH_HOME>\profiles\<profile 名>\cordis.patch.yml
+# （本机默认 <DSH_HOME> = <DSH_HOME>，profile 名 = desktop）
+#
+# ---- 怎么用 ----------------------------------------------------------------
+# 这个文件本身是一个**顶层 YAML 数组**，和 profile 的 cordis.patch.yml 同构。
+# 所以最省事的做法：把下面 `- id: qq-proactive` 那一整段**追加**到你的
+# cordis.patch.yml 末尾（它和文件里其他条目同级，都以 `- id:` 开头，缩进两格）。
+#
+# ⚠️ cordis.patch.yml **不能是空文件、也不能只剩注释**，否则 DSH 启动失败。
+#    没有任何条目时要写成 `[]`。
+# ============================================================================
+
+- id: qq-proactive
+  config:
+    # ---- 连接方式（必填）--------------------------------------------------
+    # reverse = 插件当服务端、等 NapCat 拨进来。本项目用这个：
+    # 只有 reverse 能同时收到事件（群里在聊什么）和发消息，主动插话才成立。
+    mode: reverse
+    host: 127.0.0.1
+    port: 18661                      # 插件监听的端口，NapCat 那边的 url 必须填同一个
+    accessToken: '<与 NapCat 侧一致的 token>'
+    # ⚠️ reverse 模式下 accessToken **留空会直接拒绝启动**（fail-closed）。
+    #    空的监听端口 = 同网段任何人都能操控这个 QQ 号。
+
+    # 另外两种模式（用不上就别写）：
+    #   mode: forward → 插件作为客户端拨给 NapCat，此时改用 url: 'ws://127.0.0.1:3001'
+    #   mode: http    → 只发不收（收不到群消息 ⇒ 主动插话无效），改用 httpUrl: 'http://127.0.0.1:3000'
+
+    # ---- 身份（必填）------------------------------------------------------
+    botQQ: '<机器人自己的 QQ>'
+    adminUsers: [ '<你自己的 QQ>' ]
+    # ⚠️ 至少填一个**人**的 QQ。只填机器人自己 = 你的私聊会被标成「受限用户:仅问答」，
+    #    让小鲸鱼干活的请求会被拒。
+
+    # ---- 出站白名单（用户的硬边界，只在这一处配）--------------------------
+    # 「只允许往和本人的私聊 + 指定的群发消息」，其余一律拒绝。
+    # 所有出站（工作汇报、主动插话、上线播报）都过这一关。
+    # ⚠️ 想扩大范围**先问用户**，别顺手改成 open。
+    dmPolicy: allowlist
+    allowFrom: [ '<你自己的 QQ>' ]
+    groupPolicy: allowlist
+    groupAllowFrom: [ '<群号1>', '<群号2>' ]
+    requireMention: true             # 群里只有 @ 到机器人才被动回复
+
+    # ---- 会话与模型 -------------------------------------------------------
+    agentPreset: gugu                # 用「小鲸鱼」人设的 preset，见本目录 config.example.gugu-preset.md
+    provider: '<你的 provider 名，例如 deepseek-official>'
+    model: '<支持识图的模型名，例如 deepseek-flash>'
+    reasoningEffort: low             # 闲聊不需要 max，配大了会把私聊堵死（有实测事故）
+    persona: ''                      # 留空即可：人格从 qq-gugu.toml 的 [personality] 读
+    workspacePath: '<会话的工作目录，例如你的项目根>'
+    onlineAnnounce: 'private:<你自己的 QQ>'   # 插件启动时播报「小鲸鱼上线了」；留空 = 不播报
+
+    # ---- 主动发言（机会主义插话）------------------------------------------
+    # 只有 enabled 是必须显式写的，其余门槛都有代码默认值；要调就在
+    # qq-gugu.toml 里调（支持「通配一套 + 指定群覆盖」，见那个示例文件）。
+    proactive:
+      enabled: true
+
+    # ---- 工作汇报（把工作会话的进度同步到 QQ）-----------------------------
+    report:
+      enabled: true
+      target: 'private:<你自己的 QQ>'   # ⚠️ enabled=true 时**必填**，否则拒绝启动
+      minIntervalMinutes: 10
+      onlyWhenBlocked: true             # 只在「卡住等人」时才喊，普通完成不打扰
+      waitingNotifyAfterMinutes: 90
+      awayMode: false                   # true = 出门模式，普通完成也汇报
+
+# ============================================================================
+# 字段速查（按「填错会怎样」排序）
+#
+#   字段              必填  填错/漏填的后果
+#   ----------------  ----  --------------------------------------------------
+#   mode              ✔     插件不激活
+#   accessToken       ✔     reverse 模式**拒绝启动**（端口都不开）
+#   port              ✔     非法端口 → 拒绝启动
+#   adminUsers        ✔     你的私聊被当受限用户，小鲸鱼拒绝干活
+#   allowFrom         ✔     私聊方向全被拒（连上线播报都发不出去）
+#   groupAllowFrom    ✔     群方向全被拒（工作汇报、主动插话都静默失败）
+#   agentPreset       ○     留空 → 用 standard，小鲸鱼会用「编码助手」口吻说话
+#   report.target     ✔*    *仅当 report.enabled=true；漏了 → 拒绝启动
+#   workspacePath     ○     留空 → 会话落进 DSH 进程的工作目录，GUI 里归属会跑偏
+#   provider/model    ○     留空 → 跟部署全局默认（可能是不支持识图的模型）
+# ============================================================================

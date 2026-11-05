@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-<profile 名>",
+  "private": true,
+  "dependencies": {
+    "dsh-qq-proactive": "link:<本仓库的绝对路径>"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-qq-proactive"
+      ]
+    }
+  }
+}
