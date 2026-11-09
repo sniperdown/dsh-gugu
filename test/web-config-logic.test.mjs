@@ -85,6 +85,10 @@ test('④ 第二张卡正好五类：行为规则 / 转交规矩 / 发 QQ 的规
     'memory.inject_max_chars',
     'memory.inject_private_as_section',
     'memory.learned_enabled',
+    // 2026-11-06：判定日志三项（开关 / 路径 / 轮转上限）也落在 `[proactive]`。
+    'proactive.gauge_log',
+    'proactive.gauge_log_max_mb',
+    'proactive.gauge_log_path',
     'proactive.interject_prompt',
     'proactive.judge_mode',
     'proactive.judge_mode_private',
@@ -130,8 +134,9 @@ test('④ 第二张卡内部分组：单字段各自成组，记忆是唯一 ≥
     'memory',
     'proactive',
   ]);
-  // `send` 4 项（B2/B3 加的），`memory` 3 项，`proactive` 5 项（含预检模型与两段提示词）。
-  assert.deepEqual(groups.map((group) => group.fields.length), [1, 4, 3, 5]);
+  // `send` 4 项（B2/B3 加的），`memory` 3 项，`proactive` 8 项
+  // （2026-10-30 加了预检模型与两段提示词；2026-11-06 又加了判定日志三项）。
+  assert.deepEqual(groups.map((group) => group.fields.length), [1, 4, 3, 8]);
   assert.deepEqual(
     groups.map((group) => sectionFoldable(group.fields.length)),
     [false, true, true, true],

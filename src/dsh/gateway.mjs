@@ -13,11 +13,9 @@
  * @module qq-dsh/gateway
  */
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { normalizeEvent, outboundMessage, segmentsToText, voiceSegment } from '../onebot/protocol.mjs';
 import { ACTION, chatIdFromSessionKey, parseChatId, renderPrompt, resolveSessionTarget, truncateReply } from './routing.mjs';
-import { dshHome } from './paths.mjs';
 import { createDebouncer } from './debounce.mjs';
 import { splitChatId, SEGMENT_PLACEHOLDERS } from '../onebot/protocol.mjs';
 import { collectImageSegments, sniffImageMediaType, summarizeRecordSegment, toImageBlocksDetailed } from './media.mjs';
@@ -331,12 +329,10 @@ export class Gateway {
     promptCfg = null,
     signal,
     mood = null,
-    // 出站白名单判定器（`outbound-allow.mjs` 的 `createOutboundAllow(...)` 产物），
-    // 由 `index.mjs` 拿配置里的 `allowFrom` / `groupAllowFrom` 装配后传进来。
-    //
-    // ⚠️ **名单必须由调用方注入，网关自己不读配置、也没有内置名单**：
-    // 不注入时**一律拒绝**（fail-closed）。
+    /** 出站白名单判定器（`outbound-allow.mjs` 的 `createOutboundAllow(...)` 产物），由装配方注入；不注入 = 一律拒发。 */
     outboundAllow = null,
+    /** 内部通道没给 `replyTo` 时的默认收件人（`private:<QQ>`）；留空 = 只写会话、不推 QQ。 */
+    ownerChatId = '',
     // `ctx.attachments`：把入站图片存成 DSH 附件（见 media.mjs），让小鲸鱼真的能看图。
     // 为 null 时不识图，退回 `[图片]` 占位符 —— 没有附件服务的环境照样能跑。
     attachments = null,
@@ -402,6 +398,19 @@ export class Gateway {
      */
     judgeModePrivate = '',
     precheck = null,
+    /**
+     * **判官/启发式决策日志**（2026-11-06，`gauge-log.mjs` 的 `createGaugeLog(...)` 产物）。
+     *
+     * 为什么挂在网关而不是引擎：这条记录要的是"启发式给的分数 + 判官给的结论"
+     * **同一行的快照**，而判官在网关里、在 `engine.decide()` **之后**才跑
+     * （理由见下面 `handleEvent` 那段 precheck 的注释）。引擎拿不到判官结论，
+     * 网关两样都有 —— 而且"最终发出了什么"也只有在网关里才真的发生了。
+     *
+     * 为 null ⇒ **一个字节都不写**（默认；由 `index.mjs` 按 `[proactive] gauge_log`
+     * 决定要不要注入）。它和 `outboundLedger` / `stickerLibrary` 同一条规矩：
+     * **观测设施绝不是必需品**，坏了只能影响它自己。
+     */
+    gaugeLog = null,
     /**
      * 关系记账（A 段，2026-11-04）。`null` = 不做记账（默认，测试与未注入时）；
      * 由 `index.mjs` 注入一个 ledger 实例开启，**只记**「说过几句 / 认识多久 / 被点名几次」。
@@ -489,12 +498,6 @@ export class Gateway {
     // **不是**每一轮的延迟，而是少数几次的最坏延迟。留成构造参数是为了让
     // 装配方（`index.mjs`）将来能从配置里给；不传就是 1.2 秒。
     quoteLookupTimeoutMs = QUOTE_LOOKUP_TIMEOUT_MS,
-    /**
-     * 内部唤醒/投递（定时器、系统事件）**没给 `replyTo` 时**的默认收件人，
-     * 形如 `private:<QQ>`。由装配方从配置注入（`[owner] admins` 第一个）；
-     * 留空 ⇒ 内部通道只写会话、不推 QQ。**不在代码里写死任何人。**
-     */
-    ownerChatId = '',
   }) {
     this.transport = transport;
     /**
@@ -508,8 +511,6 @@ export class Gateway {
       ? quoteLookupTimeoutMs
       : QUOTE_LOOKUP_TIMEOUT_MS;
     this.router = router;
-    /** 内部通道的默认收件人（见构造函数参数；空串 = 不推 QQ）。 */
-    this.ownerChatId = String(ownerChatId ?? '').trim();
     this.engine = engine;
     this.responder = responder;
     /**
@@ -584,6 +585,7 @@ export class Gateway {
     this.signal = signal;
     // 没注入判定器 = 没有名单 → 一律拒发（fail-closed，见构造函数注释）。
     this.outboundAllow = typeof outboundAllow === 'function' ? outboundAllow : DENY_ALL;
+    this.ownerChatId = String(ownerChatId ?? '').trim();
     this.mood = mood;
     /**
      * 每个会话"最近发出去的正文" —— 供 `#send` 的**同文短窗去重**用（2026-10-16）。
@@ -707,6 +709,11 @@ export class Gateway {
     this.judgeModePrivate = String(judgeModePrivate ?? '').trim();
     /** 模式 2 的预检器（`{enabled, check, describe}` 或 null）。模式 1/3 用不到它。 */
     this.precheck = precheck;
+    /**
+     * 判官/启发式决策日志（可为 null）。见构造函数里 `gaugeLog` 那段说明。
+     * 所有调用点都在 `try/catch` 里，且**永不 await** —— 它在消息热路径上。
+     */
+    this.gaugeLog = gaugeLog ?? null;
     // 关系记账：**没注入就是关**（测试/离线保持零副作用），由 index.mjs 显式传入。
     this.relations = relationLedger ?? null;
     // 群聊防抖：攒批后只对最后一条跑判定（前几条由 engine.ingest 补进转录，不丢）。
@@ -1143,6 +1150,45 @@ export class Gateway {
       return { outcome: OUTCOME.OBSERVED, reason: decision.reason, chatId: message.chatId };
     }
 
+    // ===== 判官/启发式决策日志（2026-11-06）=====
+    //
+    // ## 为什么在这里开一条
+    //
+    // 走到这一行 = **启发式那一步已经给了"要说"**（`decision.speak === true`），
+    // 也就是需求里说的「过阈值那一刻」：再往下一层要么是判官（precheck），
+    // 要么直接进 agent。**再早**（没过阈值 / 被闸门挡掉）研究的对象就不存在了
+    // —— 那类"为什么没冒泡"由 `engine.journal` 回答（闸门原因 + 分数）。
+    //
+    // ## 为什么不是"立刻写盘"而是先攒着
+    //
+    // 判官在下面几行才跑，而记录里**必须有判官的结论、原文、耗时、模型**
+    // （那是这次改动的核心诉求）。若在过阈值那一刻就写、之后再补字段，
+    // 就得回头改写文件 —— 行级 JSONL 里最危险的操作（截断/半行/并发）。
+    // ⇒ 一条只写一次，写盘时机在判官回来之后；记录的 `messageAt` 仍然是
+    //   **过阈值那条消息的时刻**（语义没变，只是落盘晚了那一次调用的几百毫秒）。
+    //   `reply` 阶段再补一行 `kind:'out'`，两行用同一个 `turnId` 关联。
+    //
+    // ⚠️ `gaugeLog` 为 null（没开）时这一整段是**空转**：不建对象、不碰磁盘。
+    //    下面每个调用点都还各自包着 try/catch —— 它**绝不许**影响这一条消息。
+    let gaugeTurn = null;
+    let gaugeLogged = false;
+    /**
+     * 判官结论的默认值 = **启发式自己拍板**。
+     *
+     * 三种情况会用到它：`judge_mode = heuristic`（默认）、`inTurn`（不调判官）、
+     * 以及 `precheck` 但没配模型 / 没注入（那两种在 `judge-mode.mjs` 里也会
+     * 降级成"该说"，只是要等到 `check()` 内部才知道）。
+     */
+    let gaugeJudge = {
+      verdict: 'speak',
+      source: 'heuristic',
+      raw: '',
+      ms: 0,
+      model: '',
+      provider: '',
+      promptChars: 0,
+    };
+
     // ===== 模式 2：precheck（过了闸门与阈值之后，**再问一次轻量模型**）=====
     //
     // 位置是这一条全部价值所在：**在 `engine.decide` 之后、进 agent 之前**。
@@ -1185,6 +1231,13 @@ export class Gateway {
       // （`#record` 是 push 引用，不是拷贝）⇒ 最终 journal / 快照里那条是完整的。
       decision.precheck = outcome;
       this.engine.annotateLastGauge(flattenPrecheck(outcome));
+
+      // 判定日志：**判官一给结论就落一行**（speak / decline / wait 都记）。
+      // ⚠️ 必须写在下面两条早退**之前** —— 「判官说不该」与「判官说等」
+      // 正是这次改动要研究的东西，漏了它们这份日志就只剩"说了话"的那些。
+      gaugeJudge = outcome;
+      gaugeTurn = this.#openGaugeLog(message, decision, outcome);
+      gaugeLogged = true;
 
       // ===== 第三态：判官说「等」（2026-11-01）=====
       //
@@ -1251,6 +1304,10 @@ export class Gateway {
         ms: outcome.ms,
       });
     }
+
+    // 没走判官（模式 1 / 模式 3 / 没配预检模型）⇒ 结论由启发式自己给，
+    // 现在把它落一行（`gaugeJudge` 还是上面那个默认值 `verdict:'speak'`）。
+    if (!gaugeLogged) gaugeTurn = this.#openGaugeLog(message, decision, gaugeJudge);
 
     // 空正文拦在"决定要回"之后。**但纯 @ 不算空**：
     // `@小鲸鱼` 却没打字是"叫你一声"，得让它应一句"在的"。
@@ -1349,7 +1406,7 @@ export class Gateway {
     // 查完就删。
     try {
       const segs = Array.isArray(message.segments) ? message.segments : [];
-      const file = path.join(dshHome(), 'media', 'qq-quote-debug.json');
+      const file = '<DSH_HOME>\\media\\qq-quote-debug.json';
       let arr = [];
       try {
         const prev = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1377,7 +1434,7 @@ export class Gateway {
     // 三个早退在 `#primeQuoted` 里 —— 正常引用一次都不问，代价为零。
     await this.#primeQuoted(message);
     const prompt = this.#buildPrompt(message, verdict, decision, richText, this.#modeFor(message, decision));
-    return this.dispatch(message, verdict, prompt, decision);
+    return this.dispatch(message, verdict, prompt, decision, gaugeTurn);
   }
 
   /**
@@ -2080,13 +2137,117 @@ export class Gateway {
   }
 
   /**
+   * 记一条「判官/启发式决策」日志（`kind:'gauge'`）—— **只读旁路**。
+   *
+   * ## 三条铁律（`gauge-log.mjs` 的文件头写着同一条）
+   *
+   * 1. **绝不抛**：它挂在每条消息的热路径上，抛出去 = 宿主进程退出
+   *    （`qq-plugin/AGENTS.md` 第三节）。所以整段一个 try/catch，失败只落 debug。
+   * 2. **不改判定**：不碰 `decision`（只读字段）、不 await、不挡发送。
+   * 3. **关着就一个字节都不碰**：`gaugeLog` 为 null / `open()` 内部判开关。
+   *
+   * ## 记哪些
+   *
+   * 只记**主动接话**的候选：过了启发式那一步、且**不是被点名**的。
+   * `@` / 私聊 / 喊名字是别人的明确请求 —— 闸门短路放行、判官压根不问，
+   * 记进来只会把"要不要插一句"的样本稀释掉。
+   *
+   * @param {object} message 触发这条判定的消息
+   * @param {object} decision `engine.decide()` 的返回值（含 `score`/`threshold`/`detail`）
+   * @param {object} judge 判官结论（`judge-mode.mjs` 的 `outcome`，或启发式的占位）
+   * @returns {{turnId: string, chatId: string, context: string}|null} 失败/关闭 ⇒ null
+   * @private
+   */
+  #openGaugeLog(message, decision, judge) {
+    const sink = this.gaugeLog;
+    if (sink === null || typeof sink !== 'object' || typeof sink.open !== 'function') return null;
+    try {
+      if (decision === null || typeof decision !== 'object' || decision.addressed === true) return null;
+      // 上下文（前 20 条转录）**只在这一刻取一次**：它和判官看到的是同一份
+      // （判官那次请求用的也是 `transcript.render(20)`），而且之后转录还会继续变。
+      // 取不到就空着 —— 绝不因为渲染失败丢掉整条记录。
+      let context = '';
+      try {
+        const transcript = typeof this.engine?.transcript === 'function'
+          ? this.engine.transcript(message.chatId)
+          : null;
+        if (transcript !== null && transcript !== undefined && typeof transcript.render === 'function') {
+          context = String(transcript.render(20) ?? '');
+        }
+      } catch {
+        context = '';
+      }
+      return sink.open({
+        chatId: message.chatId,
+        chatKind: message.kind === 'private' ? 'private' : 'group',
+        userId: message.userId,
+        messageText: message.text,
+        messageAt: message.at,
+        context,
+        score: decision.score ?? null,
+        threshold: decision.threshold ?? null,
+        // **整个分项对象**（不摊平、不挑项）—— 这是用户最想看的那一项。
+        detail: decision.detail ?? null,
+        judge,
+        pmode: this.#modeFor(message, decision),
+        // 引擎给的放行原因（`scored` / `focus` / `incomplete-followup`）：
+        // 分数没过阈值却走到这里的那几种，全靠这个字段才不会读成"阈值失效"。
+        reason: decision.reason,
+        focus: decision.focus,
+        addressed: decision.addressed === true,
+      });
+    } catch (error) {
+      this.log('debug', '判定日志：建记录失败（忽略，不影响判定）', {
+        chatId: message?.chatId ?? '',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 这一轮**真的发出去了** ⇒ 补一行 `kind:'out'`（正文 + 20 条上下文）。
+   *
+   * 正文的取法：`runTurn` 把**每一段真正发出去的文字**按顺序推进 `sentBodies`，
+   * 这里按 `\n` 拼起来 —— 与需求里"分段的话按 `\n` 拼接"一致，
+   * 且拿的是**发出去的**，不是模型原始输出（那两者在 `[不说话]` / 同文短窗 /
+   * `send_qq` 已经发过 的几种情况下并不相同）。
+   *
+   * 一段都没发出去（`[不说话]` / 空回复 / 发送全失败）⇒ **不写**：
+   * 这一行的语义是"发到群里的正文"，写空的会让人以为发了。
+   *
+   * @param {object|null} turn `#openGaugeLog` 的返回值
+   * @param {string[]|null} sentBodies `runTurn` 收集的"真的发出去的段"
+   * @private
+   */
+  #closeGaugeLog(turn, sentBodies) {
+    const sink = this.gaugeLog;
+    if (sink === null || typeof sink !== 'object' || typeof sink.complete !== 'function') return;
+    if (turn === null || typeof turn !== 'object') return;
+    try {
+      const bodies = Array.isArray(sentBodies)
+        ? sentBodies.map((text) => String(text ?? '').trim()).filter((text) => text !== '')
+        : [];
+      if (bodies.length === 0) return;
+      sink.complete(turn, { output: bodies.join('\n') });
+    } catch (error) {
+      this.log('debug', '判定日志：输出段落盘失败（忽略，不影响发送）', {
+        chatId: turn?.chatId ?? '',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
    * 把一条消息交给对应会话，并把回复发回 QQ。
    * @param {import('../onebot/protocol.mjs').InboundMessage} message
    * @param {{sessionKey: string, restricted: boolean, reason: string}} verdict
    * @param {string} prompt 已渲染好的提示词
    * @param {{addressed?: boolean}} [decision] 判定结果（用于记账：被点名的不占配额）
+   * @param {object|null} [gaugeTurn] 判定日志的句柄（见 `#openGaugeLog`）；
+   *   `null` = 没开 / 不是主动接话的候选 ⇒ 这一轮不补 `kind:'out'` 那行
    */
-  async dispatch(message, verdict, prompt, decision = {}) {
+  async dispatch(message, verdict, prompt, decision = {}, gaugeTurn = null) {
     const { chatId, kind } = message;
     // 会话去向由 routing 的纯函数决定（私聊可能是 isolated 或 main），
     // 不在这里再推一遍——两处规则漂移的后果是"消息进了错的会话"。
@@ -2114,6 +2275,15 @@ export class Gateway {
       await previous.catch(() => undefined);
     }
 
+    /**
+     * **这一轮真正发出去的正文**（按段收集，给判定日志的 `kind:'out'` 那行用）。
+     *
+     * 为什么让 `runTurn` 往里推、而不是在这里拿返回值：返回值是**模型原始输出**
+     * （`return text`），而"发到群里的是什么"还要经过 `[不说话]` 标记、静默轮、
+     * `send_qq` 已发过、同文短窗、切条这几道 —— 那些情况下两者**并不相同**。
+     * 只在 `gaugeTurn` 存在时才建数组，常规轮次不多造一个对象。
+     */
+    const sentBodies = gaugeTurn === null ? null : [];
     const task = this.runTurn({
       message,
       sessionKey,
@@ -2121,6 +2291,7 @@ export class Gateway {
       prompt,
       addressed: decision.addressed === true,
       judgeMode: this.#modeFor(message, decision),
+      sentBodies,
     });
     // 锁的键也用 sessionKey，与上面的排队判断保持一致。
     this.inFlight.set(
@@ -2133,12 +2304,17 @@ export class Gateway {
     try {
       const reply = await task;
       this.stats.dispatched += 1;
+      // 这一轮结束了 —— 真发出去的话，把正文 + 上下文补成一行（`kind:'out'`）。
+      // ⚠️ 放在 `dispatched` 之后、返回之前：**只加一行日志**，返回值的形状一个字都不动。
+      this.#closeGaugeLog(gaugeTurn, sentBodies);
       return { outcome: OUTCOME.DISPATCHED, reason: verdict.reason, chatId, reply };
     } catch (error) {
       this.stats.failed += 1;
       this.log('error', `会话 ${sessionKey} 处理失败`, {
         error: error instanceof Error ? error.message : String(error),
       });
+      // 这一轮炸了，但**已经发出去的段**仍然值得留档（"说了一半就没了"正是要查的）。
+      this.#closeGaugeLog(gaugeTurn, sentBodies);
       return {
         outcome: OUTCOME.FAILED,
         reason: verdict.reason,
@@ -2351,7 +2527,23 @@ export class Gateway {
     }
   }
 
-  async runTurn({ message, sessionKey, restricted, prompt, addressed = false, silent = false, images = [], judgeMode = 'heuristic' }) {
+  async runTurn({
+    message,
+    sessionKey,
+    restricted,
+    prompt,
+    addressed = false,
+    silent = false,
+    images = [],
+    judgeMode = 'heuristic',
+    /**
+     * **判定日志用的收集器**（2026-11-06）：把这一轮**真正发出去**的正文按段推进来。
+     *
+     * `null`（默认）= 不收集（测试 / 内部通道 / 没开日志）。**纯观察**：
+     * 推的是"已经交给 `#send` 且没被拦下"的文本，不参与任何发送决策。
+     */
+    sentBodies = null,
+  }) {
     void restricted;
 
     // B4：语音探针 —— 放在最前面，任何一条带语音的消息都会被记下来（哪怕后面失败）。
@@ -2499,6 +2691,8 @@ export class Gateway {
           segments.sent += 1;
           this.stats.replies += 1;
           this.stats.segments += 1;
+          // 判定日志：这一段的正文真发出去了 ⇒ 记下（分段的话最后按 `\n` 拼）。
+          if (sentBodies !== null) sentBodies.push(body);
         }
       } catch (error) {
         // ⚠️ **发送失败不许静默**（用户明确要求）：warn + 计数 + 台账。
@@ -2778,7 +2972,11 @@ export class Gateway {
       .then((sent) => {
         // 被"同文短窗"拦下 ⇒ 这条没真发出去，**不**该记进 replies。
         // `stats.replies` 是"她真说了几条"，虚报会让台账与快照互相矛盾。
-        if (sent !== SEND_SUPPRESSED) this.stats.replies += 1;
+        if (sent !== SEND_SUPPRESSED) {
+          this.stats.replies += 1;
+          // 判定日志：整段一次发出去的那条路径（responder 不支持 `onSegment` 时走这里）。
+          if (sentBodies !== null) sentBodies.push(text);
+        }
       });
     // 关键：让判定层知道机器人刚说过话，否则它会在自己刚回完话后立刻再冒一句。
     // `addressed` 决定这次回复是否**占用配额**：被点名的不占（那是别人找小鲸鱼）。
@@ -2790,13 +2988,15 @@ export class Gateway {
   }
 
   /**
-   * **内部投递**：不经过 QQ 入站，直接往指定会话投一轮（定时唤醒 / 系统事件走它）。
+   * **主会话 → 小鲸鱼**：内部通道投递（不经过 QQ 入站）。
    *
-   * 它不是"某个外部用户发来消息"，所以**不走入站白名单**；会话键、私聊/群聊的区分
-   * 仍然复用路由的现成逻辑，不另起一套。
+   * 用户原话：「你俩得有个沟通渠道啊，信箱不提就不会读的，一直借用小鲸鱼的私聊也不是事」。
    *
-   * - `replyTo` 给了 → 这一轮的回复发到那个 chatId（**走出站白名单**，越界会被拒）
-   * - `replyTo` 省略 → 退到配置里的主人私聊（`ownerChatId`）；没配主人 ⇒ 只写会话、不推 QQ
+   * 它不是"某个外部用户发来消息"，所以**不走入站白名单**；会话键、私聊/群聊的区分仍然复用路由的现成逻辑。
+   * 直接投进小鲸鱼的会话。
+   *
+   * - `replyTo` 给了 → 小鲸鱼的回复发到那个 chatId（**走既有白名单**，越界会被拒）
+   * - `replyTo` 省略 → **静默**：只写会话，不推 QQ，免得每条技术沟通都吵到用户
    *
    * ## ⚠️ `viewImages` 与 `sendImages` 是**反方向**的两件事
    *
@@ -2875,11 +3075,11 @@ export class Gateway {
     const verdict = this.router.resolve(message);
     // ⚠️ **这里刻意不看 `verdict.action`。**
     //
-    // 踩过的坑：虚拟消息的 `userId` 是 `'system'`，如果照搬入站那套
-    // `action !== DISPATCH 就拒绝` —— 路由会拿它去核对白名单，当然不在
-    // `allowFrom` 里，于是 `dm-denied(allowlist)`，投递被自己挡掉了。
+    // 踩过的坑：我一开始把虚拟消息的 `userId` 设成 `'alice'`，然后照搬入站那套
+    // `action !== DISPATCH 就拒绝` —— 结果路由拿 `alice` 去核对白名单，当然不在
+    // `allowFrom` 里，于是 `dm-denied(allowlist)`，投递被我自己挡掉了。
     //
-    // 想清楚：**这条路不是"外部用户给机器人发消息"，而是系统自己在叫醒它**，
+    // 想清楚：**这条路不是"外部用户给机器人发消息"，而是系统里另一个会话在跟我说话**，
     // 不该过入站白名单那道门。路由在这里唯一的用处，是告诉我 chatId 对应哪个
     // sessionKey（那个映射只有它知道）。
     //

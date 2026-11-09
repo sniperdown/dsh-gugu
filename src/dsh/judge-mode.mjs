@@ -149,6 +149,9 @@ function isKnown(provider, knownProviders) {
  * @property {string} provider 实际用的 provider
  * @property {string} model 实际用的 model
  * @property {string} raw 它答的原文（截断到 40 字）
+ * @property {string} answer 它答的原文**全文**（截到 {@link PRECHECK_ANSWER_MAX} 字）。
+ *   2026-11-06 加：判定日志（`gauge-log.mjs`）要能离线复盘"它到底答了什么"，
+ *   而 `raw` 只留 40 字。⚠️ **纯加法** —— 判定分支与采样参数一个字节都没动。
  */
 
 /**
@@ -342,8 +345,31 @@ export function parsePrecheckAnswer(raw) {
 export const DEFAULT_PRECHECK_TIMEOUT_MS = 8000;
 /** 输出预算（token）。两个字足够，越大越容易被它写出一段解释。 */
 export const PRECHECK_MAX_TOKENS = 4;
+/**
+ * 预检要不要开思考（2026-11-06 起 `'low'`）。
+ *
+ * 原来是 `'off'`：分类任务不做推理，省时省钱。代价是它**只能看一眼就给一个词**，
+ * 判「不该」判错了也没法复盘（连它当时答的原文都不留）。改成 `'off'` 即可退回原样。
+ */
+export const PRECHECK_REASONING_EFFORT = 'low';
+/** 开了思考时的输出预算：推理 token 也从这里扣，4 个连一个字都写不完。 */
+export const PRECHECK_MAX_TOKENS_WITH_REASONING = 96;
 /** 失败后重试几次（**只重试失败**，不重试"不该"）。 */
 export const PRECHECK_RETRY = 1;
+/**
+ * `outcome.answer`（判官答的**全文**）的保留上限（字符）。
+ *
+ * ## 为什么要有这个字段（2026-11-06，为"判官/启发式决策日志"加的）
+ *
+ * `outcome.raw` 的口径是**截到 40 字**（它只服务日志里"它答歪了长什么样"这一眼，
+ * 长了对日志没增量）。可判定日志（`gauge-log.mjs`）要的是**能离线复盘的原文** ——
+ * 开了思考之后（`PRECHECK_REASONING_EFFORT = 'low'`）它可能多吐几个字，
+ * 40 字会把最要紧的部分切掉。
+ *
+ * ⇒ 两个字段分工：`raw` 保持 40 字（老口径，谁都别动），`answer` 留全文。
+ * **纯加法**：判定分支、`speak` 取值、采样参数一个字节都没变。
+ */
+export const PRECHECK_ANSWER_MAX = 1000;
 
 /**
  * 造一个模式 2 预检器。
@@ -416,11 +442,16 @@ export function createPrecheck({
       const chunks = stream({
         provider,
         model,
-        // 分类任务，不需要推理 —— 也顺手省钱、省时间。
-        reasoningEffort: 'off',
+        // 分类任务不开思考 —— 也顺手省钱、省时间（与 `relay-judge` 同一条）。
+        // 2026-11-06 起改由 {@link PRECHECK_REASONING_EFFORT} 决定，默认 `'low'`。
+        reasoningEffort: PRECHECK_REASONING_EFFORT,
         system: systemText,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-        maxTokens: PRECHECK_MAX_TOKENS,
+        // 预算必须跟着思考走：推理 token 和正文共用一个额度，
+        // 开着思考还只给 4 个 ⇒ 它把额度花在推理上，正文一个字都出不来。
+        maxTokens: PRECHECK_REASONING_EFFORT === 'off'
+          ? PRECHECK_MAX_TOKENS
+          : PRECHECK_MAX_TOKENS_WITH_REASONING,
         signal: ac.signal,
       });
       for await (const chunk of chunks) {
@@ -453,6 +484,7 @@ export function createPrecheck({
     promptChars: 0,
     ...target(),
     raw: '',
+    answer: '',
   });
 
   /**
@@ -496,6 +528,8 @@ export function createPrecheck({
       return {
         speak: true, verdict: 'speak', source: 'busy',
         ms: 0, chars: 0, promptChars, ...target(), raw: '',
+        // 没问成，没有原文可留（answer 与 raw 同源，见 PRECHECK_ANSWER_MAX）。
+        answer: '',
       };
     }
 
@@ -511,6 +545,8 @@ export function createPrecheck({
           return {
             speak: true, verdict: 'speak', source: 'timeout',
             ms: Date.now() - started, chars: lastChars, promptChars, ...target(), raw: '',
+            // 超时**保留答到一半的原文**：那正是「它到底说了什么才超时」的证据。
+            answer: String(raw ?? '').trim().slice(0, PRECHECK_ANSWER_MAX),
           };
         }
         if (error !== null) {
@@ -535,6 +571,8 @@ export function createPrecheck({
             promptChars,
             ...target(),
             raw: String(raw ?? '').trim().slice(0, 40),
+            // 全文（raw 只留 40 字，判定日志要能复盘的原文）。
+            answer: String(raw ?? '').trim().slice(0, PRECHECK_ANSWER_MAX),
           };
         }
         if (verdict === 'unparsed') {
@@ -548,6 +586,7 @@ export function createPrecheck({
             speak: true, verdict: 'speak', source: 'unparsed',
             ms: Date.now() - started, chars: lastChars, promptChars, ...target(),
             raw: String(raw ?? '').slice(0, 40),
+            answer: String(raw ?? '').trim().slice(0, PRECHECK_ANSWER_MAX),
           };
         }
         return {
@@ -559,6 +598,7 @@ export function createPrecheck({
           promptChars,
           ...target(),
           raw: String(raw ?? '').trim().slice(0, 40),
+          answer: String(raw ?? '').trim().slice(0, PRECHECK_ANSWER_MAX),
         };
       }
       log('warn', 'precheck 重试后仍然失败 ⇒ 降级成「该说」（退回模式 1）', {
@@ -568,6 +608,7 @@ export function createPrecheck({
       return {
         speak: true, verdict: 'speak', source: 'error',
         ms: Date.now() - started, chars: lastChars, promptChars, ...target(), raw: '',
+        answer: '',
       };
     } catch (error) {
       // 兜底：任何没预料到的异常也走"该说"这一侧，绝不把消息处理链路炸掉。
@@ -578,6 +619,7 @@ export function createPrecheck({
       return {
         speak: true, verdict: 'speak', source: 'error',
         ms: Date.now() - started, chars: 0, promptChars, ...target(), raw: '',
+        answer: '',
       };
     } finally {
       busy = false;

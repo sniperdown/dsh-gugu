@@ -10,7 +10,7 @@
  * ⚠️ 加载时自动起一次是 **2026-10-29** 加的，专为"插件重载后配置页能接回来"：
  * 重载会 dispose 整个插件，如果新实例不自己起服务，页面那层自动重连就没有可连的对象。
  * 自动起的这一次**绝不 spawn 浏览器**（`openBrowser: false`）—— 每次重载都弹一个
- * 标签页是不能接受的；用户没有页面开着时，它 15 秒后自己关掉。
+ * 标签页是不能接受的；用户没有页面开着时，它 120 秒后自己关掉。
  *
  * ## 形态
  *
@@ -50,14 +50,14 @@
  *
  * ## 生命周期的判据（只有一条）
  *
- * `now() - max(openedAt, lastBeatAt) > idleTimeoutMs`（默认 15 秒）⇒ 自己关。
+ * `now() - max(openedAt, lastBeatAt) > idleTimeoutMs`（默认 120 秒）⇒ 自己关。
  *
  * `lastBeatAt` 来自页面每 5 秒一次的 `POST /heartbeat`；`openedAt` 只是**初值**，
  * 用来兜住「服务起来了但浏览器从未打开页面」这种情形——否则没有心跳记录时
  * 那个差值永远算不出来，服务就会一直挂着。
  *
  * 刻意**没有**任何"兜底时长"：用户明确要求过不要（"我有时候可能挂着就睡着了"）。
- * 服务的生死由心跳决定，页面关掉 15 秒后它就消失。
+ * 服务的生死由心跳决定，页面关掉 120 秒后它就消失。
  *
  * ## 路由（挂在**这个临时服务**上，不是主 webServer）
  *
@@ -162,11 +162,18 @@ export const TOKEN_HEADER = 'x-config-token';
 /** 监听地址：只回环。 */
 export const LISTEN_HOST = '127.0.0.1';
 
-/** 页面报到的间隔（页面侧的值；宿主不依赖它，只用 15 秒判死）。 */
+/** 页面报到的间隔（页面侧的值；宿主不依赖它，只用 120 秒判死）。 */
 export const HEARTBEAT_INTERVAL_MS = 5000;
 
-/** 多久没心跳就自己关。 */
-export const IDLE_TIMEOUT_MS = 15000;
+/**
+ * 多久没心跳就自己关。
+ *
+ * 120 秒 = 页面心跳间隔（5 秒）的 24 倍，是给**后台标签页**留的余量：
+ * 浏览器会把后台页的定时器降频（Chrome 的 intensive throttling 会拖到 1 分钟一次），
+ * 原来 15 秒的窗口在切走标签页之后必然超时自杀，表现就是「配置页开一会儿就断」。
+ * 服务没有被浏览器冻结，只是页面喊不出声。
+ */
+export const IDLE_TIMEOUT_MS = 120000;
 
 /** 心跳检查的节拍。 */
 export const TICK_INTERVAL_MS = 1000;
@@ -713,7 +720,7 @@ function renderMissingPage() {
 <p>临时服务已经启动，但读不到页面模板 <code>web/index.html</code>。
 请确认插件目录下存在 <code>web/</code>（页面、逻辑与样式）与 <code>preview/vendor/</code>
 （React 的两个 UMD 构建）；本机开发时这两个目录都在仓库里。</p>
-<p>地址里的令牌只对本次会话有效；页面每 5 秒报到一次，15 秒没有心跳服务就自行关闭。</p>
+<p>地址里的令牌只对本次会话有效；页面每 5 秒报到一次，120 秒没有心跳服务就自行关闭。</p>
 </main>
 </body>
 </html>`;
@@ -740,7 +747,7 @@ function renderMissingPage() {
  *   本选项由 `src/index.mjs` 在启动时填入 `web/index.html` 的内容。
  * @param {string} [options.webDir] 页面目录（`app.js` / `logic.mjs` / `style.css` / `index.html`）
  * @param {string} [options.vendorDir] React UMD 所在目录（复用 `preview/vendor/`，不复制第二份）
- * @param {number} [options.idleTimeoutMs] 多久没心跳就关（默认 15 秒）
+ * @param {number} [options.idleTimeoutMs] 多久没心跳就关（默认 120 秒）
  * @param {number} [options.tickIntervalMs] 心跳检查节拍（默认 1 秒）
  * @param {string | (() => string)} [options.upstream]
  *   主 webServer 的来源地址（`http://127.0.0.1:<port>`），`/dsh-qq-proactive/*`
@@ -924,7 +931,7 @@ export function createConfigServer({
     '<meta charset="utf-8">',
     '<title>QQ 小鲸鱼</title>',
     '<p>配置页尚未实现。',
-    // 占位页必须自己报到：服务只认心跳，15 秒没人报到就会自行关闭。
+    // 占位页必须自己报到：服务只认心跳，120 秒没人报到就会自行关闭。
     '<script>',
     'setInterval(() => {',
     '  fetch("/heartbeat" + location.search, { method: "POST" }).catch(() => {});',

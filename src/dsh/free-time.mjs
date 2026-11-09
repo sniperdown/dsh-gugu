@@ -54,6 +54,14 @@
  *   意外执行 PowerShell（唯一注入真实实现的是 `index.mjs`）。
  * - **只清自己写的 tmp**：保留最近 `screenshotsKeep` **轮**，别的文件一律不碰。
  *
+ * ## 唤醒时带上「用户最近在电脑上」（2026-11-09 用户批准）
+ *
+ * 长唤醒的提示词末尾追加一段 `activity.mjs` 压出来的时间线（最近 2 小时的前台窗口 +
+ * 总览 + 当前状态，≤500 字）。三条边界：
+ * - **只加长唤醒**：短追问一个字都不加（追问的语义是"他是不是突然不回了"）。
+ * - **加在这轮内部消息的正文里**，不进 system prompt —— 否则前缀缓存整段作废。
+ * - 拿不到摘要就**什么都不加**，行为与改动前逐字节一致（`appendActivity`）。
+ *
  * ## 几个刻意的取舍
  * - **不排队**：她正在跟人说话（`binder.locks` 有锁）就整轮跳过，不是排到后面 ——
  *   排进去会让"她自己的时间"和"回用户的话"挤在一起，两件事都变怪。
@@ -78,6 +86,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { ACTIVITY_HOURS, readActivitySummary } from './activity.mjs';
 import { pruneScreenshots } from './screen-capture.mjs';
 
 /**
@@ -117,22 +126,45 @@ function localDateTimeParts(at) {
 }
 
 /**
+ * 把「用户最近在电脑上」的摘要拼到唤醒提示词**后面**（2026-11-09 用户批准）。
+ *
+ * - 只拼在**长唤醒**（自由活动轮）那条上；短追问（followup）**一个字都不加** ——
+ *   追问是"他是不是突然不回了"，跟"用户刚才在打游戏还是写代码"没关系。
+ * - 拿不到摘要（`null` / 空串 / 空白）⇒ 原样返回 `base`，**一个字节都不动**。
+ * - 只进**这一轮内部消息的正文**，不进 system prompt：system prompt 变一个字，
+ *   前缀缓存整段作废（那是每轮都付的钱）。
+ *
+ * @param {string} base 原本那条提示词
+ * @param {unknown} activityText `readActivitySummary()` 的 `text`（可为空）
+ * @returns {string}
+ */
+function appendActivity(base, activityText) {
+  const text = String(activityText ?? '').trim();
+  if (text === '') return base;
+  return `${base}\n\n${text}`;
+}
+
+/**
  * 叫醒她时说的那段话。内容随预算变，所以是函数。
  *
  * 2026-10-29：**配置优先**。`[free_time] wakePrompt` 写了非空文本 ⇒ 用那一份，
  * 并替换占位符 `{{budget}}` / `{{date}}` / `{{time}}`；没写 / 只有空白 ⇒
  * **原样用下面的内置文案**（那段是用户定稿的，一个字都不许改 —— 只是"变成兜底"）。
  *
+ * 2026-11-09：`activityText`（用户最近 2 小时的电脑活动摘要）拼在**末尾**，
+ * 用空行隔开；空 ⇒ 与加它之前逐字节一致（见 {@link appendActivity}）。
+ *
  * @param {{tokenBudgetPerTurn?: number, wakePrompt?: string}} cfg
  * @param {number} [at] 这次唤醒的时刻（占位符 `{{date}}` / `{{time}}` 用）
+ * @param {string} [activityText] 活动摘要正文（可空）
  */
-function buildWakePrompt({ tokenBudgetPerTurn, wakePrompt } = {}, at = Date.now()) {
+function buildWakePrompt({ tokenBudgetPerTurn, wakePrompt } = {}, at = Date.now(), activityText = '') {
   const budget = Number.isFinite(tokenBudgetPerTurn) ? tokenBudgetPerTurn : 20000;
   const custom = String(wakePrompt ?? '');
   if (custom.trim() !== '') {
-    return fillPlaceholders(custom, { budget: String(budget), ...localDateTimeParts(at) });
+    return appendActivity(fillPlaceholders(custom, { budget: String(budget), ...localDateTimeParts(at) }), activityText);
   }
-  return [
+  return appendActivity([
     '【你自己的时间】',
     '（这是插件按定时器自动叫醒你的一条内部提示 —— 不是用户在找你，也不用当成有人在问你话。）',
     '',
@@ -144,7 +176,7 @@ function buildWakePrompt({ tokenBudgetPerTurn, wakePrompt } = {}, at = Date.now(
     '',
     '如果看到什么想告诉用户，直接说出来就行：插件会把这一轮的话发到 QQ 私聊（只发私聊）。',
     '如果这一轮没什么想说的，就只回一句 [不说话]，我不会发出去。',
-  ].join('\n');
+  ].join('\n'), activityText);
 }
 
 /**
@@ -236,6 +268,11 @@ function normalizeShotFormat(value) {
  * @param {number} [options.captureTimeoutMs] 单次截图超时（分屏要截多张，别给太小）
  * @param {({dir: string, keep: number}) => object} [options.prune] 清理函数（测试可注入）
  *   ⚠️ `keep` 的单位是**轮**（一次唤醒 = 一轮 = 每块屏一张），不是文件数。
+ * @param {(options: {hours: number, now: number}) => Promise<{text?: string}|null>} [options.activity]
+ *   「用户最近 2 小时电脑活动」的取数函数（默认 `activity.mjs` 的 `readActivitySummary`）。
+ *   **只影响长唤醒**；返回 `null` / 抛错 ⇒ 提示词一个字都不加。
+ *   ⚠️ **测试必须显式注入**（`() => null`）：默认实现会读本机真实日志，
+ *   那会让"提示词逐字节相等"这类断言随当天日志飘。
  * @param {string} [options.statePath] 跨重启状态的落盘路径（空 = 不落盘，测试默认）。
  *   只存 `lastUserMessageAt` / `followupDone` 两项 —— 见模块注释"只有两个字段持久化"。
  */
@@ -250,6 +287,7 @@ export function createFreeTime({
   screenshotsDir = '',
   captureTimeoutMs = 15_000,
   prune = pruneScreenshots,
+  activity = readActivitySummary,
   statePath = '',
   // 用户的会话键（2026-10-24，P1-4 / P2-6）：由装配层用会话映射表解析好传进来。
   // 可以是**字符串**（固定）或**函数**（每 tick 现取 —— P2-6 之后新聊天会在第一次派发时
@@ -578,6 +616,30 @@ export function createFreeTime({
   }
 
   /**
+   * 取一次「用户最近在电脑上」的摘要正文（2026-11-09）。
+   *
+   * **永不抛**，也**永不返回非字符串**：拿不到就是空串（= 提示词里一个字都不加，
+   * 与这次改动之前逐字节一致）。读日志失败只是"这轮少一段上下文"，
+   * 不该让唤醒变成 `wake-error`。
+   *
+   * @param {number} at 这次唤醒的时刻（摘要窗口是 `[at - 2h, at)`）
+   * @returns {Promise<string>}
+   */
+  async function readActivityText(at) {
+    if (typeof activity !== 'function') return '';
+    try {
+      const summary = await activity({ hours: ACTIVITY_HOURS, now: at });
+      if (summary === null || typeof summary !== 'object') return '';
+      return String(summary.text ?? '').trim();
+    } catch (error) {
+      log('debug', '她自己的时间：活动摘要没取到（忽略）', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return '';
+    }
+  }
+
+  /**
    * 叫醒她一轮。
    * @returns {Promise<{woke: boolean, reason: string, sent: boolean, chars: number}>}
    *   **永不 reject** —— 它挂在定时器上。
@@ -632,11 +694,15 @@ export function createFreeTime({
     // 🔴 2026-10-23：**短追问不截图**（用户明确要求：截图只给长唤醒）。
     const shot = isLong ? await takeScreenshot(cfg) : null;
     const viewImages = shot !== null && shot.ok === true && Array.isArray(shot.paths) ? [...shot.paths] : [];
+    // 2026-11-09：**只有自由活动轮**带「用户最近 2 小时在电脑上」的摘要。
+    // 短追问（followup）这里恒为空串 —— 追问是"他是不是突然不回了"，
+    // 塞进"用户刚才在打游戏"会把那一轮的话题拽偏（用户明确要求只加长唤醒）。
+    const activityText = isLong ? await readActivityText(at) : '';
     try {
       reply = await gateway.deliverFromAlice({
         // 提示词能被配置覆盖（2026-10-29）：`[free_time] wakePrompt` / `followupPrompt`；
         // 空 ⇒ 用本文件里的内置文案。`at` 只给占位符 `{{date}}` / `{{time}}` 用。
-        text: isLong ? buildWakePrompt(cfg, at) : buildFollowupPrompt(cfg, at),
+        text: isLong ? buildWakePrompt(cfg, at, activityText) : buildFollowupPrompt(cfg, at),
         replyTo: null,
         viewImages,
       });

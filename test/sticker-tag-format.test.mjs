@@ -49,10 +49,8 @@ import { resolveModelToml } from '../src/dsh/toml-files.mjs';
  * 这里**不能**再直接读主文件 —— 那会读到"空的 prompt"，看起来像提示词丢了。
  * 用解析器问"这一刻加载器会读哪份"，和加载器走同一条路。
  */
-// ⚠️ 这是**集成用例**：它钉"部署里那份 toml 的提示词与代码兜底是否一致"。
-// 公开仓库里没有部署配置，所以默认跳过；要看它跑，设 `QQ_GUGU_TOML=<你自己的 qq-gugu.toml>`。
-const MAIN_TOML = process.env.QQ_GUGU_TOML ?? '';
-const REAL_TOML = MAIN_TOML === '' ? '' : resolveModelToml(MAIN_TOML, 'sticker').path;
+const MAIN_TOML = process.env.QQ_GUGU_TOML ?? '<DSH_HOME>\\profiles\\<profile>\\qq-gugu.toml';
+const REAL_TOML = resolveModelToml(MAIN_TOML, 'sticker').path;
 
 /** 把提示词切成行，便于"只在【tags】那一段里断言"。 */
 const linesOf = (text) => String(text).split('\n');
@@ -127,6 +125,25 @@ test('★ 分隔符改了之后，{tags} 仍然只被填一次、别的占位符
   // 自定义提示词（toml 给的那种）也要吃到同一份填法
   const custom = buildStickerInstruction({ gate: { prompt: 'T:{tags}' } });
   assert.ok(custom.includes(`「${STICKER_TAGS[0]}」`), '自定义提示词里的 {tags} 也要用「」清单填');
-  assert.ok(custom.includes(`「${STICKER_TAGS[16]}」`), '最后一个枚举值也要在');
+  assert.ok(custom.includes(`「${STICKER_TAGS[STICKER_TAGS.length - 1]}」`), '最后一个枚举值也要在');
   assert.equal(custom.includes(STICKER_TAGS.join('/')), false);
+});
+
+test('★★ 新标签 `幸灾乐祸` 进了可选清单，并带一句语义分界（区别于调侃吐槽 / 得意自信）', () => {
+  // 为什么钉语义而不只钉"清单里有它"：这三个桶的边界靠**文字**，不靠词形。
+  // 只加标签不加说明 ⇒ 模型会把幸灾乐祸的图继续判成「调侃吐槽」（用户反馈的原问题）。
+  const listLine = tagListLineOf(buildStickerInstruction());
+  assert.ok(listLine.includes('「幸灾乐祸」'), '可选清单里要有新标签（每个值单独用「」括起来）');
+
+  assert.ok(DEFAULT_STICKER_PROMPT.includes('幸灾乐祸'), '兜底提示词正文里要提到新标签');
+  assert.ok(DEFAULT_STICKER_PROMPT.includes('不是安慰、也不是自嘲'), '要写明它不是安慰、也不是自嘲');
+  assert.ok(
+    DEFAULT_STICKER_PROMPT.includes('调侃吐槽') && DEFAULT_STICKER_PROMPT.includes('得意自信'),
+    '要把它和最像的两个老标签放在一起比（只说"看别人倒霉"分不开「调侃吐槽」）',
+  );
+
+  // ⚠️ 边界：2026-11-06 这次改动的范围**不含** `<DSH_HOME>` 的 toml，
+  //    所以线上 `[sticker_gate] prompt` 里还没有这一段（可选**列表**会自动跟上，
+  //    因为它来自 `{tags}` 占位符）。toml 同步之后，这条用例可以升级成"两边都有"。
+  assert.ok(DEFAULT_STICKER_PROMPT.includes('{tags}'), '兜底仍是模板');
 });

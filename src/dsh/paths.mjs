@@ -19,7 +19,7 @@
  * 旧文件保留，观察一段时间后再由人工清理。环境变量覆盖仍然优先（测试与排障依赖它）。
  *
  * 尚未迁入的部分（有意保留原位）：
- * - 配置（`profiles/desktop/qq-gugu*.toml`）：由 profile 引用，移动需同步改 profile；
+ * - 配置（`profiles/<profile>/qq-gugu*.toml`）：由 profile 引用，移动需同步改 profile；
  * - 调试快照与出站台账（`<DSH_HOME>/media`）：路径已写在多个会话的文档里，
  *   迁移会造成跨会话文档漂移，待协调后再动。
  */
@@ -56,6 +56,39 @@ export function configDir(env = process.env) {
 /** 状态文件的完整路径。 */
 export function statePath(name, env = process.env) {
   return path.join(stateDir(env), name);
+}
+
+/**
+ * 宿主媒体目录：`<DSH_HOME>/media`。
+ *
+ * ⚠️ **和上面的 `mediaDir()` 不是一个目录**，别合并：
+ *   · `mediaDir()` = `<DSH_HOME>/qq-gugu/media`（插件归拢出来的新家，空的）；
+ *   · 这个是 `<DSH_HOME>/media` —— **既有文件都在这里**：`qq-outbound.jsonl`、
+ *     `qq-proactive-debug.json`、`qq-stickers.json`、`sticker-audit\`。
+ *     它们的路径写在多个会话的文档里（见文件头「尚未迁入的部分」），
+ *     所以新文件要用这个位置时**走这里、别自己拼字符串**（拼出来的迟早和
+ *     `outbound-ledger.mjs` 那份默认路径分叉，而分叉的表现是"什么都没记"）。
+ */
+export function dshMediaDir(env = process.env) {
+  return path.join(dshHome(env), 'media');
+}
+
+/**
+ * 媒体文件的完整路径 + 环境变量覆盖（与 {@link resolveStatePath} 同一条约定）。
+ *
+ * 环境变量优先（排障时用户自己指定一个临时文件），否则 `<DSH_HOME>/media/<name>`。
+ * **不做迁移** —— 这里放的都是新文件，没有旧位置可迁。
+ *
+ * @param {object} options
+ * @param {string} options.name 文件名
+ * @param {string} [options.envVar] 覆盖用环境变量名
+ * @param {object} [options.env]
+ * @returns {string}
+ */
+export function resolveMediaPath({ name, envVar = '', env = process.env } = {}) {
+  const override = envVar === '' ? '' : String(env[envVar] ?? '').trim();
+  if (override !== '') return override;
+  return path.join(dshMediaDir(env), name);
 }
 
 /**

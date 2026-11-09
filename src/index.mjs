@@ -22,7 +22,7 @@
  *    涨不涨（涨 = 正在说话）。规矩在 AGENTS.md。
  *
  * 2026-10-16 记：`[memory] learned_enabled`（旧记忆库开关）加在这里，
- *    真源在 `<DSH_HOME>\profiles\desktop\qq-gugu.toml` 的 `[memory]` 段。
+ *    真源在 `<DSH_HOME>\profiles\<profile>\qq-gugu.toml` 的 `[memory]` 段。
  */
 import path from 'node:path';
 import fs from 'node:fs';
@@ -30,7 +30,6 @@ import { fileURLToPath } from 'node:url';
 import { createTransport, backoffDelay } from './onebot/transport.mjs';
 import { ProactiveEngine, defaultTriggerConfig } from './proactive/engine.mjs';
 import { Gateway } from './dsh/gateway.mjs';
-import { dshHome } from './dsh/paths.mjs';
 import { Router, defaultConfig, parseChatId, chatIdFromSessionKey, POLICY, normalizeIdList } from './dsh/routing.mjs';
 import { createSessionMap, createSessionResolver } from './dsh/chat-sessions.mjs';
 import { SessionBinder, resolveGroupDenyTools, publishToolBridge } from './dsh/binding.mjs';
@@ -88,6 +87,9 @@ import {
   DEFAULT_STICKER_INDEX_PATH,
   createStickerLibrary,
 } from './dsh/sticker-library.mjs';
+// 表情包**人工标注**（2026-11-06）：配置页「表情标注」页的后端（抽样 / 落库 / 对账 / 导出）。
+// 只读写 `qq-stickers.json` 与图片目录，**不碰模型那条路**，也不在页面上提供任何删除入口。
+import { createStickerAnnotator, createStickerLabelRoutes } from './dsh/sticker-labeling.mjs';
 import { KnowledgeBase } from './dsh/knowledge.mjs';
 import { parseToml } from './dsh/toml.mjs';
 import { createRelationsLedger } from './dsh/relations-ledger.mjs';
@@ -95,6 +97,9 @@ import { createRecallStore } from './dsh/recall.mjs';
 import { createRecallCompressor } from './dsh/recall-compress.mjs';
 import { createTranscriptStore } from './dsh/transcript-store.mjs';
 import { resolveStatePath } from './dsh/paths.mjs';
+// 判官/启发式决策日志（2026-11-06）：把每次"要不要主动接话"的判定追加到 JSONL，
+// 供离线研究。**默认关闭**（`[proactive] gauge_log`），开关由用户自己开。
+import { createGaugeLog, DEFAULT_GAUGE_LOG_MAX_BYTES } from './dsh/gauge-log.mjs';
 import { createTopicStore } from './dsh/topics.mjs';
 import { createTopicExtractor } from './dsh/topics-extract.mjs';
 import { buildSnapshot, createDebugWriter, defaultDebugPath } from './dsh/debug-snapshot.mjs';
@@ -381,9 +386,9 @@ const CONFIG_SHAPE = {
    * 要加就自己往这里写 —— 默认值不替任何人猜。
    */
   imageOriginalDirs: [
-    'D:\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Pic\\*\\Ori',
-    'D:\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Emoji\\emoji-recv',
-    'D:\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Emoji\\emoji-recv\\*\\Ori',
+    'D:\\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Pic\\*\\Ori',
+    'D:\\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Emoji\\emoji-recv',
+    'D:\\QQNT\\data\\{qq}\\nt_qq\\nt_data\\Emoji\\emoji-recv\\*\\Ori',
   ],
   /**
    * **图片描述缓存表**（跨会话；用户拍板放 `<DSH_HOME>\` 下）。
@@ -680,7 +685,7 @@ const CONFIG_SHAPE = {
    * 为什么要它：实测用户在测试群连发「小鲸鱼在不在」「小鲸鱼？」都沉默 ——
    * 因为引擎从没把"名字被叫到"这件事告诉 gauge。
    */
-  botNames: ['小鲸鱼', '鲸鱼', '小鲸'],
+  botNames: ['小鲸鱼', '鸽子', '小鲸鱼', '主会话'],
   /** 工作完成汇报：把工作会话的进度同步到指定 QQ 会话。 */
   /**
    * 工作汇报（**只在该喊的时候喊**）。
@@ -868,7 +873,7 @@ export function resolveConfig(raw = {}) {
   // **所有"读 toml 的段"共用这一个路径**（2026-10-21 线上事故）。
   //
   // 以前这里没填 `tomlPath` → 只有 `loadFreeTimeConfig()` / `loadLearnedMemoryConfig()`
-  // / `loadRelayConfig()` / `loadSendConfig()` / `loadMoodConfig()` 那几个自己写了
+  // / `loadSendConfig()` / `loadMoodConfig()` 那几个自己写了
   // `config?.tomlPath ?? defaultTomlPath()` 兜着；而后加的
   // **`loadPersonaSections()` 与 `loadOwnerConfig()` 只认 `config.tomlPath`**
   // （它们的约定是"回退由 index.mjs 负责"，见 owner.mjs 里的注释）
@@ -896,7 +901,7 @@ export function apply(ctx, rawConfig = {}) {
   // 知识库：从 MaiBot.db 导出的 JSON 加载。读不到就空库，不影响插件。
   // 动态学来的记忆单独存 learned-memory.json，启动时重放、学习后回写（重启不丢）。
   //
-  // ⚠️ 2026-10-05 挪位置：这两个文件原来躺在 `<maibot>\`（MaiBot 的导出目录）。
+  // ⚠️ 2026-10-05 挪位置：这两个文件原来躺在 `<napcat>\maimai2-export\`（MaiBot 的导出目录）。
   // 用户指出它们**是我们自己的数据、而且是所有会话共用的**，不该放在别人的地盘里 ——
   // 于是搬到工作区的 `shared/`（跨会话共享目录）。
   //
@@ -1614,6 +1619,10 @@ export function apply(ctx, rawConfig = {}) {
     cacheMs: visionGateConfig?.cacheMs ?? null,
     local: visionGateConfig === null ? null : `${visionGateConfig.local.provider}/${visionGateConfig.local.model}`,
     cloud: visionGateConfig === null ? null : `${visionGateConfig.cloud.provider}/${visionGateConfig.cloud.model}`,
+    // ⭐ 2026-11-06：「图片描述」那条路的思考开关（`[vision_gate] enableThinking`，默认 false）。
+    //    挂载日志里少它 = "toml 里写了到底读到没有"只能翻代码/翻快照，而它是
+    //    "配置静默不生效"那一族坑的第一个观测点。⚠️ 别和 `[sticker_gate]` 那个键搞混。
+    descEnableThinking: visionGateConfig === null ? null : visionGateConfig.enableThinking === true,
     // ⚠️ 这一条是"手动配置赢"的可执行说明（免得以后有人猜）：
     manualWins: '[sticker_gate] provider/model 非空的那条调用不受门控影响',
   });
@@ -1654,6 +1663,29 @@ export function apply(ctx, rawConfig = {}) {
     ...(imageDescriber.canUseVision()
       ? { recognize: (image, meta) => imageDescriber.describeSticker({ ...image, source: meta ?? null }) }
       : {}),
+  });
+
+  // ── 表情包人工标注（2026-11-06）──
+  //
+  // 为什么单独一个实例：它写的是**同一份** `qq-stickers.json`，但用的是"读盘 → 只改这一条
+  // → 备份 + 原子写"的路。库那边的 `persist()` 是按内存形状整份重写的，所以写完必须
+  // 通过 `applyAnnotation` 把字段同步进 `stickerLibrary` 的内存条目，否则它下一次
+  // `seen` 自增就会把 `manual*` 静默抹掉（这是这条线上最容易踩的一点）。
+  //
+  // 它**永不抛**给调用方：读写失败一律降级成 `{ok:false}`，配置页那一页显示提示。
+  const stickerLabeler = createStickerAnnotator({
+    indexPath: config.stickerIndexPath,
+    dir: config.stickerDir,
+    log,
+    onSaved: (md5, patch) => {
+      try {
+        stickerLibrary.applyAnnotation(md5, patch);
+      } catch (error) {
+        log('debug', '标注字段同步回表情包库内存失败（文件已经写好了）', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
   });
 
   // ===== 「说不说」的裁量模式（画布上的三种，2026-10-13 落地模式 2/3）=====
@@ -1724,6 +1756,48 @@ export function apply(ctx, rawConfig = {}) {
     log('info', '判定模式 = inTurn（总分当倾向塞进提示词，由该轮自己决定说不说）', {});
   }
 
+  // ===== 判官/启发式决策日志（2026-11-06）=====
+  //
+  // 用户要的是**离线研究**：「这条消息为什么被判不该说」——
+  // 而现在只有内存计数（快照的 `proactive.states` / `proactive.judge`），
+  // 回答不了"分够不够、判官答了什么、它看到的是哪 20 条上下文"。
+  //
+  // 真源是 toml 的 `[proactive]`（与 `judge_mode` 同一层，理由也一样：
+  // 这是**行为配置**，用户在 `qq-gugu.toml` 里切，不是 cordis 装什么）。
+  //
+  // ```toml
+  // [proactive]
+  // gauge_log = true            # 默认 false（关着时一个字节都不写）
+  // gauge_log_path = ""         # 空 = <DSH_HOME>/media/qq-gauge.jsonl
+  // gauge_log_max_mb = 50       # 超过就轮转成 .1（只留一个旧文件）
+  // ```
+  //
+  // ⚠️ 三个键都走 `proactiveMerged`（`defaultTriggerConfig() ← CONFIG_SHAPE.proactive
+  // ← toml`），**不是只读 cordis 那一层** —— 只读 cordis 的话，toml 里写了
+  // `gauge_log = true` 会**静默不生效**（本项目最贵的那一类坑）。
+  //
+  // ⚠️ `file` 只在用户**显式给了非空路径**时才传：`gauge-log.mjs` 的口径是
+  // "缺字段 = 走默认路径，显式空串 = 明确关掉"（同 `outbound-ledger.mjs`）。
+  // 配置页上的空串语义是"用默认"，所以在这里把空串**翻译成"不传"**。
+  const gaugeLogPathCfg = String(proactiveMerged.gauge_log_path ?? '').trim();
+  const gaugeLogMaxMb = Number(proactiveMerged.gauge_log_max_mb);
+  const gaugeLog = createGaugeLog({
+    config: {
+      enabled: proactiveMerged.gauge_log === true,
+      ...(gaugeLogPathCfg === '' ? {} : { file: gaugeLogPathCfg }),
+      maxBytes: Number.isFinite(gaugeLogMaxMb) && gaugeLogMaxMb > 0
+        ? Math.round(gaugeLogMaxMb * 1024 * 1024)
+        : DEFAULT_GAUGE_LOG_MAX_BYTES,
+    },
+    log,
+  });
+  if (gaugeLog.enabled()) {
+    // 这一行是"开关到底读到没有"的唯一答案（改 toml 必须重载才生效 —— 见 AGENTS.md）。
+    log('info', `判定日志已开启：${gaugeLog.file()}`, {
+      maxBytes: gaugeLog.stats().maxBytes,
+    });
+  }
+
   // 网关。注意 transport 要晚一点才有 selfId，所以 botQQ 的判断放在事件处理里。
   const gateway = new Gateway({
     transport,
@@ -1743,9 +1817,6 @@ export function apply(ctx, rawConfig = {}) {
     // 真相在 binder 那边（`historyShrank` / 流式帧数）。传进去之后，
     // "静默丢消息"那条路会留一条 warn + 进快照的 `stats.lostReplies` / `emptyReply`。
     diagnoseEmptyReply: (sessionKey) => binder.emptyReplyDiagnosis(sessionKey),
-    // 内部通道没给收件人时的默认目标：主人（`[owner] admins` 第一个）。
-    // 没配主人就留空 ⇒ 内部通道只写会话、不推 QQ（不在代码里写死任何人的号）。
-    ownerChatId: ownerCfg.admins.length > 0 ? `private:${ownerCfg.admins[0]}` : '',
     log,
     maxReplyChars: config.maxReplyChars,
     // B2（2026-10-25）：`[send] auto_reply` —— 决定"她这一轮没调 `send_qq` 时要不要自动发"。
@@ -1773,6 +1844,7 @@ export function apply(ctx, rawConfig = {}) {
     // 心情模型能看到几条聊天记录（`[mood] transcript_messages`，默认 20）。
     moodTranscriptMessages: Number(moodCfg.transcriptMessages) > 0 ? Number(moodCfg.transcriptMessages) : 20,
     outboundAllow,
+    ownerChatId: ownerCfg.admins.length > 0 ? `private:${ownerCfg.admins[0]}` : '',
     // 识图：把入站图片存成 DSH 附件再喂给模型（见 dsh/media.mjs）。
     // 可选读取 —— 没有附件服务的环境（包括测试里的假 ctx）里插件照样要能跑，
     // 只是看不到图、退回 `[图片]` 占位符。`ctx.get` 本身也可能不存在，所以要双重防御。
@@ -1798,6 +1870,9 @@ export function apply(ctx, rawConfig = {}) {
     judgeMode,
     judgeModePrivate,
     precheck,
+    // 判官/启发式决策日志（2026-11-06）。关着时它自己的 `open()` 立刻返回 ——
+    // 网关那边不会为它做任何额外的事（不建对象、不碰磁盘、不加 await）。
+    gaugeLog,
   });
 
   sendToolRef.fn = (args) => gateway.sendFromTool(args);
@@ -2233,7 +2308,7 @@ export function apply(ctx, rawConfig = {}) {
   // 留空则不播报。走 `speakProactively`，因此照样受同一道出站白名单约束。
   const announceTo = String(config.onlineAnnounce ?? '');
   if (announceTo !== '') {
-    const markPath = path.join(dshHome(), 'media', 'qq-proactive-announce.json');
+    const markPath = '<DSH_HOME>\\media\\qq-proactive-announce.json';
     const processStartedAt = Math.round(Date.now() - process.uptime() * 1000);
     let lastAnnouncedAt = null;
     try {
@@ -2268,7 +2343,7 @@ export function apply(ctx, rawConfig = {}) {
   // 本插件的主动层**不建 DSH 会话、也不回复**，状态只活在内存里——从磁盘
   // 无法判断它有没有收到消息、转录有没有建起来、主动插话为什么没触发。
   // 之前每次排查都要用户复制粘贴控制台；把关键计数节流落盘后，
-  // agent 可以自己读文件自证。
+  // agent 可以自己读文件自证（见 docs/mascot-architecture.md）。
   //
   // 可用 `QQ_PROACTIVE_DEBUG_FILE=` 置空来关闭。
   const debugFile =
@@ -2788,6 +2863,12 @@ export function apply(ctx, rawConfig = {}) {
                 // 空串 ⇒ 代码里那两句原文，页面显示为空代表"用兜底"）。
                 interject_prompt: String(proactiveMerged?.interject_prompt ?? ''),
                 precheck_system: String(proactiveMerged?.precheck_system ?? ''),
+                // 2026-11-06：判定日志的三项生效值（配置页"改了但没重载"就靠这一列）。
+                gauge_log: proactiveMerged?.gauge_log === true,
+                gauge_log_path: String(proactiveMerged?.gauge_log_path ?? ''),
+                gauge_log_max_mb: Number(proactiveMerged?.gauge_log_max_mb) > 0
+                  ? Number(proactiveMerged.gauge_log_max_mb)
+                  : DEFAULT_GAUGE_LOG_MAX_BYTES / (1024 * 1024),
               },
               // 小鲸鱼的推理等级（2026-10-21）：配置页的 `effective` 就是这个值 ——
               // 它和 `file` 里的 `[agent] reasoning` 不同 = 改过但没重载。
@@ -2814,6 +2895,9 @@ export function apply(ctx, rawConfig = {}) {
           // 不 spawn 系统浏览器（内部与测试验证数据时用），缺省等价于 `true`。
           // 这里不做二次处理 —— 路由定义与它必须保持一致，重复解析只会制造分叉。
           ...createConfigServerRoutes({ configServer, log }),
+          // 表情包人工标注（2026-11-06）：batch / save / report / export / image 五条。
+          // 同样挂在主 webServer 上，页面经临时服务转发过来（图片也是 —— 不新开端口）。
+          ...createStickerLabelRoutes({ annotator: stickerLabeler, log }),
         ];
         webCtx.effect(
           () => {
@@ -3627,7 +3711,7 @@ export function createFreeTimeHttpRoutes({
    * 备份规则与 `POST /config` **完全一致**（2026-10-21 修）：
    * - 落**工作区**备份目录（`backupDir`，默认 `defaultBackupDir()`）—— 复用
    *   `backupToml`，**不再**在 toml 旁边拼 `qq-gugu.toml.bak-<ms>`；
-   *   以前那样两份备份落在两个地方，而 `<DSH_HOME>\profiles\desktop\` 那棵
+   *   以前那样两份备份落在两个地方，而 `<DSH_HOME>\profiles\<profile>\` 那棵
    *   树对某些进程只读，历史上还留了 2 份删不掉的残留。
    * - **被拒的写入删掉刚做的备份**：备份是"这次写入的退路"，写没发生就没有
    *   留它的理由（参数非法 / 校验不过 / 写入失败三条分支都删）。
@@ -4577,7 +4661,7 @@ function buildConfigPagePayload({
 
 /** 默认的 qq-gugu.toml 路径（与 cordis.patch.yml 同级）。 */
 function defaultTomlPath() {
-  return process.env.QQ_GUGU_TOML ?? path.join(dshHome(), 'profiles', 'desktop', 'qq-gugu.toml');
+  return process.env.QQ_GUGU_TOML ?? '<DSH_HOME>\\profiles\\<profile>\\qq-gugu.toml';
 }
 
 /**
@@ -4736,7 +4820,7 @@ export function loadStickerGate(config, log = () => {}) {
  * [vision_gate]
  * freeMiB = 7168                       # 空闲显存低于它 ⇒ 用云
  * cacheMs = 5000                       # 显存读数缓存多久（别每条消息 fork 一次 nvidia-smi）
- * provider = "discovery-intern-ai"     # 云端（v4f）
+ * provider = "your-provider"            # 云端（填你自己的）
  * model    = "deepseek-v4-flash-vision"
  * localProvider = "local-llamacpp"     # 本地（留空 = 没有本地路 ⇒ 永远走云）
  * localModel    = "qwen3.5-4b-q4km-vision"
@@ -4785,6 +4869,15 @@ export function loadVisionGate(config, log = () => {}) {
         using: gate[key],
       });
     }
+  }
+  // ⭐ 2026-11-06：`enableThinking` 是这一节**唯一的布尔项**（图片描述那条路的思考开关）。
+  //    写错类型同样要留痕：`normalizeVisionGate` 认不出就回退 `false`（= 继续关思考），
+  //    而"回退了却一个字都不说"正是这个项目最贵的那类坑。
+  if (section.enableThinking !== undefined && typeof section.enableThinking !== 'boolean') {
+    log('warn', '[vision_gate] enableThinking 不是布尔值，已回退默认值 false（图片描述仍然关思考）', {
+      wrote: section.enableThinking,
+      using: gate.enableThinking,
+    });
   }
   return gate;
 }
@@ -5159,7 +5252,7 @@ export const DEFAULT_FREE_TIME_CONFIG = Object.freeze({
   // 默认 2 = 双屏各一张，也就是**改动前的行为**。
   screenshotsMaxPerWake: 2,
   // 2026-10-29：两段提示词的**兜底是代码**（`free-time.mjs` 的 `buildWakePrompt` /
-  // `buildFollowupPrompt`）。空串 / 只有空白 = 用内置文案（与 `[send] rule` 同语义）。
+  // `buildFollowupPrompt`）。空串 / 只有空白 = 用内置文案（与 `[relay] rule` 同语义）。
   wakePrompt: '',
   followupPrompt: '',
 });

@@ -147,6 +147,9 @@ function harness(options = {}) {
     capture: 'capture' in options ? options.capture : null,
     screenshotsDir: options.screenshotsDir ?? '',
     captureTimeoutMs: options.captureTimeoutMs,
+    // 2026-11-09：活动摘要默认 **返回 null** —— 默认实现会读本机真实日志，
+    // 那会让下面这些"提示词逐字节相等"的断言随当天日志飘。要测注入的那条另写文件。
+    activity: 'activity' in options ? options.activity : () => null,
     ...('prune' in options ? { prune: options.prune } : {}),
     // 跨重启状态（2026-10-23）：默认不落盘（不传 = 空串），要测持久化时显式给路径。
     ...('statePath' in options ? { statePath: options.statePath } : {}),

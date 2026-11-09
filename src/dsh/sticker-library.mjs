@@ -153,6 +153,16 @@ function textOf(value) {
 }
 
 /**
+ * 标签数组的形状保真（**不校验枚举**）。
+ *
+ * 2026-11-06 增：人工标注那几组字段（`modelTags` / `manualTags`）要原样穿过
+ * 索引的读写 —— 它们的值域校验在 `sticker-labeling.mjs`，这一层只管"别丢"。
+ */
+function tagListOf(value) {
+  return Array.isArray(value) ? value.map((tag) => String(tag).trim()).filter((tag) => tag !== '') : [];
+}
+
+/**
  * **这条段的"表情包证据"是什么** —— 判定 + 诊断二合一。
  *
  * 判据（2026-10-08 定稿）：
@@ -339,6 +349,16 @@ export function createStickerIndex({
             tags: Array.isArray(value?.tags) ? value.tags.map((t) => String(t)).filter((t) => t !== '') : [],
             // 2026-10-19：描述也存（pick 拿它打分；空串 = 这库还是老的，靠审核表兜）。
             desc: textOf(value?.desc),
+            // 2026-11-06：人工标注字段（`sticker-labeling.mjs` 写）**必须一起收进来**。
+            // 理由：`persist()` 是按内存里的形状整份重写的 —— 这里漏掉一个字段，
+            // 下一次 `seen` 自增就会把它静默抹掉，而磁盘上看起来"什么都没发生"。
+            // 这里**只做形状保真**（数组/字符串），枚举校验留给写的那一方。
+            modelTags: tagListOf(value?.modelTags),
+            modelDesc: textOf(value?.modelDesc),
+            manualTags: tagListOf(value?.manualTags),
+            manualDesc: textOf(value?.manualDesc),
+            manualVerdict: textOf(value?.manualVerdict),
+            manualAt: textOf(value?.manualAt),
             source: value?.source !== null && typeof value?.source === 'object'
               ? { chatId: textOf(value.source.chatId), userId: textOf(value.source.userId) }
               : { chatId: '', userId: '' },
@@ -423,7 +443,14 @@ export function createStickerIndex({
   }
 
   /** 把内部条目变成**只读快照**（调用方改不到库内部状态）。 */
-  const snapshot = (md5, entry) => ({ md5, ...entry, tags: [...entry.tags], source: { ...entry.source } });
+  const snapshot = (md5, entry) => ({
+    md5,
+    ...entry,
+    tags: [...entry.tags],
+    modelTags: [...entry.modelTags],
+    manualTags: [...entry.manualTags],
+    source: { ...entry.source },
+  });
 
   return {
     /** 按内容 md5 取一条（只读快照）。 */
@@ -476,6 +503,10 @@ export function createStickerIndex({
       const key = String(md5 ?? '').trim().toLowerCase();
       const file = textOf(value?.file);
       if (!usable || key === '' || file === '') return false;
+      // 2026-11-06：人工标注那几组字段**在调用方没写时沿用旧值**。
+      // `harvest` 传的是一条全新的对象（没有 manual*），若直接覆盖，
+      // 一条已经被人工标过的图只要再被偷到一次（`set` 覆盖同一 md5），标注就没了。
+      const existing = entries.get(key);
       entries.set(key, {
         file,
         path: textOf(value?.path),
@@ -490,11 +521,40 @@ export function createStickerIndex({
         tags: Array.isArray(value?.tags) ? value.tags.map((t) => String(t)).filter((t) => t !== '') : [],
         // 2026-10-19：set 这条也要存 desc —— 只改解析那处，回填会跑了但没落库。
         desc: textOf(value?.desc),
+        modelTags: Array.isArray(value?.modelTags) ? tagListOf(value.modelTags) : (existing?.modelTags ?? []),
+        modelDesc: typeof value?.modelDesc === 'string' ? textOf(value.modelDesc) : (existing?.modelDesc ?? ''),
+        manualTags: Array.isArray(value?.manualTags) ? tagListOf(value.manualTags) : (existing?.manualTags ?? []),
+        manualDesc: typeof value?.manualDesc === 'string' ? textOf(value.manualDesc) : (existing?.manualDesc ?? ''),
+        manualVerdict: typeof value?.manualVerdict === 'string'
+          ? textOf(value.manualVerdict)
+          : (existing?.manualVerdict ?? ''),
+        manualAt: typeof value?.manualAt === 'string' ? textOf(value.manualAt) : (existing?.manualAt ?? ''),
         source: value?.source !== null && typeof value?.source === 'object'
           ? { chatId: textOf(value.source.chatId), userId: textOf(value.source.userId) }
           : { chatId: '', userId: '' },
       });
       persist();
+      return true;
+    },
+    /**
+     * 把**人工标注字段**同步进内存条目（**不落盘**）。
+     *
+     * `sticker-labeling.mjs` 的保存路径是"自己带备份 + 原子写文件"，写完之后调这里
+     * 把同一条内存记录也更新掉。不同步的话，下一次 `bumpSeen` / `recordUse` 的
+     * `persist()` 会按内存里的旧形状重写整份文件，`manual*` 就被静默抹掉了。
+     *
+     * @returns {boolean} 内存里有没有这一条（没有 = 这次多半是新写的，忽略即可）
+     */
+    applyAnnotation(md5, patch) {
+      const key = String(md5 ?? '').trim().toLowerCase();
+      const found = entries.get(key);
+      if (found === undefined || patch === null || typeof patch !== 'object') return false;
+      if (Array.isArray(patch.modelTags)) found.modelTags = tagListOf(patch.modelTags);
+      if (typeof patch.modelDesc === 'string') found.modelDesc = textOf(patch.modelDesc);
+      if (Array.isArray(patch.manualTags)) found.manualTags = tagListOf(patch.manualTags);
+      if (typeof patch.manualDesc === 'string') found.manualDesc = textOf(patch.manualDesc);
+      if (typeof patch.manualVerdict === 'string') found.manualVerdict = textOf(patch.manualVerdict);
+      if (typeof patch.manualAt === 'string') found.manualAt = textOf(patch.manualAt);
       return true;
     },
     /** 又见到同一张（**不是**发出）：`seen` 加一。 */
@@ -1082,6 +1142,15 @@ export function createStickerLibrary({
     /** 给"认"回写情感标签（**允许空数组**）。 */
     setTags(md5, tags) {
       return table.setTags(md5, tags);
+    },
+    /**
+     * 人工标注字段的**内存同步**（不落盘）。
+     *
+     * 见 `createStickerIndex.applyAnnotation`：保存那条路自己写文件（带备份），
+     * 这里只负责让内存形状跟上去，避免下一次 `persist()` 把 `manual*` 抹掉。
+     */
+    applyAnnotation(md5, patch) {
+      return table.applyAnnotation(md5, patch);
     },
     /** 库目录（诊断用）。 */
     dir: () => stickerDir,

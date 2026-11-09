@@ -83,6 +83,13 @@ function emptyCounts() {
     lastMs: 0,
     /** 最近一次的 `source` 原文（`reply` / `decline` / `timeout` / `error` / `unparsed` / `busy` / `no-model`）。 */
     lastSource: '',
+    /**
+     * 最近一次它**实际答出来的原文**（截断 80 字；`''` = 它一个字都没吐）。
+     *
+     * 为什么要留：`lastSource` 只说明"归到哪个桶"，可判「不该」判错了、或者答成
+     * `unparsed`，光看桶名根本不知道它当时到底写了什么。留着才好复盘。
+     */
+    lastAnswer: '',
     /** 最近一次**失败**的时刻（ISO；`''` = 没失败过）。 */
     lastFailedAt: '',
     /** 最近一次失败的原因：`timeout` / `error` / `unparsed` / `''`。 */
@@ -198,13 +205,16 @@ export function createJudgeStats({ now = Date.now, maxSessions = 64, tail = 10 }
   }
 
   /** 记"最近一次"的几样东西（时间戳取**最大值**，与项目里其它 `last*At` 同一条道理）。 */
-  function touch(counts, bucket, ms, atMs, sourceText) {
+  function touch(counts, bucket, ms, atMs, sourceText, answerText) {
     if (atMs > counts.lastAtMs) {
       counts.lastAtMs = atMs;
       counts.lastAt = isoText(atMs);
     }
     counts.lastMs = ms;
     if (sourceText !== '') counts.lastSource = sourceText;
+    // 与 `lastMs` / `lastSource` 同一口径：**不做时间戳比较**，就是最近一次调用的答案。
+    // 这样"最近一次它没吐字"也会如实显示成空串，不会被上一条的旧答案盖着。
+    counts.lastAnswer = typeof answerText === 'string' ? answerText : '';
     if (bucket === 'timeout' || bucket === 'error' || bucket === 'unparsed') {
       if (atMs >= counts.lastFailedAtMs) {
         counts.lastFailedAtMs = atMs;
@@ -241,6 +251,10 @@ export function createJudgeStats({ now = Date.now, maxSessions = 64, tail = 10 }
         ? outcome.source.trim()
         : '';
       const bucket = classifySource(rawSource);
+      // 它实际吐出来的字（判官现在开着思考，答的可能是一句话，不只是「该 / 不该」）。
+      const rawAnswer = outcome !== null && typeof outcome === 'object' && typeof outcome.raw === 'string'
+        ? outcome.raw.trim().slice(0, 80)
+        : '';
       // 耗时归一：`NaN` / 负数都是坏数据 ⇒ 0（别让它们进快照，读的人分不清"没有"和"算坏了"）。
       const ms = Math.max(0, numberOr0(outcome !== null && typeof outcome === 'object' ? outcome.ms : 0));
       let atMs = 0;
@@ -256,14 +270,14 @@ export function createJudgeStats({ now = Date.now, maxSessions = 64, tail = 10 }
         sessions.set(key, row);
       }
       bump(row, bucket);
-      touch(row, bucket, ms, atMs, rawSource);
+      touch(row, bucket, ms, atMs, rawSource, rawAnswer);
       // ⚠️ 淘汰**必须放在 `touch` 之后**：`touch` 才刚把这一条的 `lastAtMs` 写进去。
       //    放在插入之后、`touch` 之前的话，新会话的 `lastAtMs` 还是 0 ⇒
       //    **刚记下的那一条会被当成"最久没判定"淘汰掉**（第一版就是这么写的，测试抓到了）。
       evictIfNeeded();
 
       bump(total, bucket);
-      touch(total, bucket, ms, atMs, rawSource);
+      touch(total, bucket, ms, atMs, rawSource, rawAnswer);
       total.lastChatId = key;
     } catch {
       /* 计数失败不是故障：热路径上宁可少一个数，也不能把消息链炸掉 */
@@ -303,6 +317,7 @@ export function createJudgeStats({ now = Date.now, maxSessions = 64, tail = 10 }
             lastAt: row.lastAt,
             lastMs: row.lastMs,
             lastSource: row.lastSource,
+            lastAnswer: row.lastAnswer,
             lastFailedAt: row.lastFailedAt,
             lastFailedReason: row.lastFailedReason,
           },
@@ -331,6 +346,7 @@ export function createJudgeStats({ now = Date.now, maxSessions = 64, tail = 10 }
           lastAt: total.lastAt,
           lastMs: total.lastMs,
           lastSource: total.lastSource,
+          lastAnswer: total.lastAnswer,
           lastChatId: total.lastChatId,
           lastFailedAt: total.lastFailedAt,
           lastFailedReason: total.lastFailedReason,

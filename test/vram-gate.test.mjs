@@ -3,7 +3,7 @@
  *
  * ## 为什么这组测试必须存在
  *
- * 用户要的是一个 **if**：「空闲显存 < 7G ⇒ v4f，否则本地」。
+ * 用户要的是一个 **if**：「空闲显存 < 7G ⇒ 云，否则本地」。
  * 一个 if 的坏法**全都不报错**：
  *
  * - 方向写反（显存少反而去拉 6 GB 的本地模型）—— 照样跑，只是在真机上把卡挤爆；
@@ -61,8 +61,8 @@ test('★ 默认阈值就是用户说的「7g」= 7168 MiB（不是 7000，也�
   assert.equal(DEFAULT_VISION_GATE.freeMiB, 7 * 1024);
   assert.equal(DEFAULT_VISION_GATE.freeMiB, 7168);
   assert.equal(DEFAULT_VISION_GATE.cacheMs, 5000);
-  assert.equal(DEFAULT_VISION_GATE.cloud.provider, 'discovery-intern-ai');
-  assert.equal(DEFAULT_VISION_GATE.cloud.model, 'deepseek-v4-flash-vision');
+  assert.equal(DEFAULT_VISION_GATE.cloud.provider, 'your-provider');
+  assert.equal(DEFAULT_VISION_GATE.cloud.model, 'your-vision-model');
   // 本地那半**默认空** ⇒ 默认没有本地路（没配 provider 的部署不该"看起来能走本地"）。
   assert.equal(DEFAULT_VISION_GATE.local.provider, '');
   assert.equal(DEFAULT_VISION_GATE.local.model, '');
@@ -90,7 +90,7 @@ test('夹紧：认不出的、缺的字段回退默认值；cloud 缺一半时**
 
 // ─────────────────────────────────────────────── ★ 两个分支（用户要的那个 if）
 
-test('★★ 空闲显存 < 阈值 ⇒ 用云（v4f）', async () => {
+test('★★ 空闲显存 < 阈值 ⇒ 用云（云）', async () => {
   const probe = fakeProbe(3000);
   const decide = createVisionGate({
     gate: { freeMiB: 7168, local: { provider: 'local-llamacpp', model: 'qwen3.5-4b-q4km-vision' } },
@@ -99,8 +99,8 @@ test('★★ 空闲显存 < 阈值 ⇒ 用云（v4f）', async () => {
   const d = await decide({ localProvider: 'local-llamacpp', localModel: 'qwen3.5-4b-q4km-vision' });
   assert.equal(d.use, 'cloud');
   assert.equal(d.reason, 'vram-low');
-  assert.equal(d.provider, 'discovery-intern-ai');
-  assert.equal(d.model, 'deepseek-v4-flash-vision');
+  assert.equal(d.provider, 'your-provider');
+  assert.equal(d.model, 'your-vision-model');
   assert.equal(d.freeMiB, 3000);
   assert.equal(d.thresholdMiB, 7168);
   assert.equal(probe.calls, 1);
@@ -258,7 +258,7 @@ test('决策结果带齐"事后能复盘"的字段（日志里要能看出为什
     gate: {
       freeMiB: 7168,
       cacheMs: 3000,
-      cloud: { provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' },
+      cloud: { provider: 'your-provider', model: 'your-vision-model' },
       local: { provider: 'local-llamacpp', model: 'qwen3.5-4b-q4km-vision' },
     },
     probe: fakeProbe(2000),
@@ -269,7 +269,7 @@ test('决策结果带齐"事后能复盘"的字段（日志里要能看出为什
     'ageMs', 'cached', 'cloud', 'freeMiB', 'local', 'model', 'provider', 'reason',
     'thresholdMiB', 'use',
   ]);
-  assert.equal(d.cloud.provider, 'discovery-intern-ai');
+  assert.equal(d.cloud.provider, 'your-provider');
   assert.equal(d.local.provider, 'local-llamacpp');
   assert.equal(d.thresholdMiB, 7168);
   assert.equal(d.cached, false);
@@ -298,7 +298,7 @@ test('`decide.config()` 报出当前生效的参数（"toml 到底读到没有"�
   const cfg = decide.config();
   assert.equal(cfg.freeMiB, 4096);
   assert.equal(cfg.local.provider, 'lp');
-  assert.equal(cfg.cloud.provider, 'discovery-intern-ai');
+  assert.equal(cfg.cloud.provider, 'your-provider');
 });
 
 // ─────────────────────────────────────────────── 真探针（不依赖显卡）

@@ -618,3 +618,147 @@ select option {
 .boot-error[hidden] {
   display: none;
 }
+
+/* ---------------- 表情标注（2026-11-06） ---------------- */
+
+/*
+ * 一屏 12 张：卡片按最小 286px 自动排（960px 页面 = 3 列 × 4 行），
+ * 每张内部仍然是"左图 / 右模型原判"，下面是标签与三档。
+ */
+.annotate-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(286px, 1fr));
+  gap: 10px;
+}
+
+.annotate-card {
+  padding: 10px 12px;
+  gap: 6px;
+}
+
+.annotate-head {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.annotate-thumb-box {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.annotate-thumb {
+  width: 104px;
+  height: 104px;
+  object-fit: contain;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--hover-bg);
+}
+
+.annotate-id {
+  font-size: 10.5px;
+  line-height: 1.4;
+  word-break: break-all;
+  color: var(--text-muted);
+}
+
+.annotate-model {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.annotate-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--hover-bg);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.chip-model {
+  color: var(--text-secondary);
+}
+
+/* 17 个标签的勾选条：小胶囊，勾上才上色 —— 一眼能看出"人工选了什么"。
+ * （`flex-wrap` 已经管住换行：标签数量再变也只是多一行胶囊，不用改这条规则。） */
+.annotate-tag-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.chip-check input {
+  margin: 0;
+  cursor: pointer;
+}
+
+.chip-check-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.annotate-size {
+  width: 64px;
+}
+
+/* 报告里的两张表：纯 grid，不用 <table>（深色主题下更好控）。 */
+.annotate-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.annotate-row {
+  display: grid;
+  grid-template-columns: 84px repeat(6, minmax(52px, 1fr));
+  gap: 6px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border-soft);
+  align-items: baseline;
+}
+
+.annotate-row-head {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.annotate-row-compare {
+  grid-template-columns: 104px minmax(0, 1.4fr) minmax(0, 1.4fr) 92px;
+}
+
+.annotate-compare-id {
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}

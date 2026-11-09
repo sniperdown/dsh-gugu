@@ -153,6 +153,21 @@ const RAW_CONFIG_FIELDS = [
   // 拆成独立文件反而会把"说不说"这件事拆散。
   { key: 'proactive.precheck_model', label: '预检模型', section: 'proactive', sectionPath: ['proactive'], tomlKey: 'precheck_model', type: 'text', effectivePath: ['proactive', 'precheck_model'], default: '' },
 
+  // ── 判官/启发式决策日志（2026-11-06，`gauge-log.mjs`） ──
+  //
+  // 把**每一条过了启发式阈值的候选**（分数 / 阈值 / 分项 / 判官结论与原文 /
+  // 判官模型与耗时）追加一行到 JSONL，供离线研究"这条为什么被判不该说"。
+  // 真发出去的那一轮再补一行正文 + 20 条上下文，两行用同一个 `turnId` 关联。
+  //
+  // ⚠️ **默认关闭**（用户 2026-11-06 的要求）：它记的是**群聊正文**
+  // （`messageText` + `context` + `output`），开之前得想清楚这个文件给谁看。
+  { key: 'proactive.gauge_log', label: '判定日志开关', section: 'proactive', sectionPath: ['proactive'], tomlKey: 'gauge_log', type: 'bool', effectivePath: ['proactive', 'gauge_log'], default: false },
+  // 空串 = 用默认路径 `<DSH_HOME>/media/qq-gauge.jsonl`（**空串不是"关掉"**：
+  // 开关是上面那一项。`gauge-log.mjs` 那边"路径显式空串 = 关"的口径是给
+  // 代码层调用的，配置层这里把空串当"走默认"，否则页面上清空路径会静默关掉功能）。
+  { key: 'proactive.gauge_log_path', label: '判定日志路径（空=默认）', section: 'proactive', sectionPath: ['proactive'], tomlKey: 'gauge_log_path', type: 'text', effectivePath: ['proactive', 'gauge_log_path'], default: '' },
+  { key: 'proactive.gauge_log_max_mb', label: '判定日志轮转阈值（MB）', section: 'proactive', sectionPath: ['proactive'], tomlKey: 'gauge_log_max_mb', type: 'number', effectivePath: ['proactive', 'gauge_log_max_mb'], default: 50 },
+
   // ── 心情（默认 qq-gugu.mood.toml；没拆分时在主文件） ──
   // `default` 只用于"生效值取不到时页面上怎么显示"，**真值由加载器决定**（同一份默认值写在加载器里）。
   { key: 'mood.reasoning_effort', label: '心情推理档位', section: 'mood', sectionPath: ['mood'], tomlKey: 'reasoning_effort', type: 'enum', options: [...REASONING_EFFORT_VALUES], effectivePath: ['mood', 'reasoningEffort'], default: 'off' },
@@ -165,6 +180,12 @@ const RAW_CONFIG_FIELDS = [
   { key: 'vision_gate.cloud.model', label: '云端 model', section: 'vision_gate', sectionPath: ['vision_gate', 'cloud'], tomlKey: 'model', type: 'text', effectivePath: ['vision', 'cloud', 'model'], default: '' },
   { key: 'vision_gate.local.provider', label: '本地 provider', section: 'vision_gate', sectionPath: ['vision_gate', 'local'], tomlKey: 'provider', type: 'text', effectivePath: ['vision', 'local', 'provider'], default: '' },
   { key: 'vision_gate.local.model', label: '本地 model', section: 'vision_gate', sectionPath: ['vision_gate', 'local'], tomlKey: 'model', type: 'text', effectivePath: ['vision', 'local', 'model'], default: '' },
+  // ⭐ 2026-11-06：**图片描述**这条路的思考开关（`[vision_gate] enableThinking`，
+  //    默认 `false` = 加这个键之前的行为，逐字节不变）。
+  //    ⚠️ 和下面 `sticker_gate.enableThinking` **不是同一个键**：那个管「认」（表情包审核），
+  //    这个管「转发里那张图配一句话」。两个都叫 enableThinking、都默认 false，但落在
+  //    两个文件（`qq-gugu.vision.toml` / `qq-gugu.sticker.toml`）的两段里 —— 别照着改串了。
+  { key: 'vision_gate.enableThinking', label: '识图 · 开思考', section: 'vision_gate', sectionPath: ['vision_gate'], tomlKey: 'enableThinking', type: 'bool', effectivePath: ['vision', 'enableThinking'], default: false },
 
   // ── 表情包审核（qq-gugu.sticker.toml） ──
   // ⚠️ `prompt` 暂时不在这里：提示词文本的收拢是下一批，先只把"模型与阈值"搬上页。

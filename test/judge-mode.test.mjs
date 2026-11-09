@@ -203,8 +203,9 @@ test('模式 2：它答「该」⇒ 只调一次，且那次请求里带着转�
   const { opts } = stream.calls[0];
   assert.equal(opts.provider, 'deepseek-official');
   assert.equal(opts.model, 'deepseek-flash');
-  assert.equal(opts.reasoningEffort, 'off');
-  assert.equal(opts.maxTokens, 4);
+  // 2026-11-06 起开低档思考；预算跟着涨，否则推理 token 会把 4 个额度吃光、正文一个字都不出。
+  assert.equal(opts.reasoningEffort, 'low');
+  assert.equal(opts.maxTokens, 96);
   // 🔴 **一条消息**：没有 system 之外的历史、没有 assistant/tool 轮次
   assert.equal(opts.messages.length, 1);
   assert.equal(opts.messages[0].role, 'user');

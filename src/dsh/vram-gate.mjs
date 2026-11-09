@@ -60,10 +60,41 @@ export const DEFAULT_VISION_GATE = Object.freeze({
   cacheMs: 5000,
   /** `nvidia-smi` 的单次超时（毫秒）。卡上在跑大活时它会变慢，别给太紧。 */
   probeTimeoutMs: 5000,
-  /** 云那条路（v4f）。 */
-  cloud: Object.freeze({ provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' }),
+  /**
+   * 云那条路的**占位默认值** —— 必须自己填，否则调用会以"provider 不存在"失败。
+   *
+   * 留占位符而不是留空，是刻意的：留空时错误信息里只有一个空串，看不出该填什么；
+   * 写成 `your-provider` 时，报错直接把它指出来。线上真值在
+   * `<DSH_HOME>/profiles/<profile>/qq-gugu.vision.toml` 的 `[vision_gate.cloud]`。
+   */
+  cloud: Object.freeze({ provider: 'your-provider', model: 'your-vision-model' }),
   /** 本地那条路（第 2 步在 cordis.patch.yml 里加的 provider）。 */
   local: Object.freeze({ provider: '', model: '' }),
+  /**
+   * ⭐ 2026-11-06：「图片描述」那一次调用**要不要让模型思考**（默认 `false` = 不要）。
+   *
+   * ## 它怎么落地（照抄「认」那条 `DEFAULT_STICKER_GATE.enableThinking`，口径逐字一致）
+   *
+   * 这一项**只驱动那次调用的 `reasoningEffort`** —— 它是 DSH 的 LLM 环缝里**唯一**
+   * 能表达"要不要思考"的契约字段（`GenerateOptions.reasoningEffort`），
+   * 多塞别的键会被适配器**静默丢掉**：
+   *
+   * | `enableThinking` | 这次调用传什么 | 线上表现（由 provider 适配器决定） |
+   * |---|---|---|
+   * | `false`（默认） | `reasoningEffort: 'off'` | 加这个旋钮**之前**的老路，逐字节不变 |
+   * | `true` | **不发** `reasoningEffort` | 交给 provider 自己的默认档（通常就是"思考开"） |
+   *
+   * ⚠️ `true` 时**不是**发 `reasoningEffort: 'low'`：手写进配置的模型只支持 `off`
+   * （适配器的 `resolveCallConfig` 会直接抛 `UNSUPPORTED_REASONING_EFFORT`）⇒ 只能"不发"。
+   *
+   * ⚠️ 线上到底会不会出现 `enable_thinking` 一类字段，取决于 provider 路由有没有声明
+   * thinking 元数据 —— 那是 `cordis.patch.yml` 的事，不是这个文件能决定的
+   * （详见 `DEFAULT_STICKER_GATE.enableThinking` 那段"必须知道的边界"）。
+   *
+   * ⚠️ **它和 `[sticker_gate] enableThinking` 是两个键，别混**：那个管「认」（表情包审核），
+   * 这个管「转发里那张图配一句话」。两条路各有一份预算，谁也不影响谁。
+   */
+  enableThinking: false,
 });
 
 /**
@@ -75,7 +106,7 @@ export const DEFAULT_VISION_GATE = Object.freeze({
  * （见 `index.mjs` 的 `loadVisionGate`）。
  *
  * @param {unknown} raw
- * @returns {{freeMiB: number, cacheMs: number, probeTimeoutMs: number, cloud: {provider: string, model: string}, local: {provider: string, model: string}}}
+ * @returns {{freeMiB: number, cacheMs: number, probeTimeoutMs: number, cloud: {provider: string, model: string}, local: {provider: string, model: string}, enableThinking: boolean}}
  */
 export function normalizeVisionGate(raw = {}) {
   const src = raw !== null && typeof raw === 'object' ? raw : {};
@@ -85,6 +116,20 @@ export function normalizeVisionGate(raw = {}) {
     return Math.min(max, Math.max(min, Math.floor(n)));
   };
   const text = (value) => (typeof value === 'string' ? value.trim() : '');
+  /**
+   * 布尔项：**只认真正的布尔值**（TOML 的 `true` / `false`）。
+   *
+   * ⚠️ 认不出就回退兜底值，**而这个"夹紧"必须留痕** —— `index.mjs` 的 `loadVisionGate`
+   * 会把"写了但不是布尔"打一条 warn（和 {@link DEFAULT_VISION_GATE.enableThinking} 那条规矩一致）。
+   * 为什么不像数字那样"能转换就转换"：`"true"` / `0` / `"no"` 这类值语义有歧义，
+   * 猜错的方向是"把图片描述的思考悄悄打开 / 关掉"，而它**不报错、计数正常** ——
+   * 正是这个项目最贵的那类坑。宁可回退默认值 + 留一条 warn。
+   *
+   * @param {unknown} value
+   * @param {boolean} fallback
+   * @returns {boolean}
+   */
+  const boolIn = (value, fallback) => (typeof value === 'boolean' ? value : fallback);
   const cloud = src.cloud !== null && typeof src.cloud === 'object' ? src.cloud : {};
   const local = src.local !== null && typeof src.local === 'object' ? src.local : {};
   return {
@@ -102,6 +147,9 @@ export function normalizeVisionGate(raw = {}) {
       provider: text(local.provider),
       model: text(local.model),
     },
+    // ⭐ 2026-11-06：图片描述那条路的思考开关。**默认 `false` = 加这个键之前的行为不变**；
+    //    不是布尔值（`"true"` / `0` / 写错键名…）⇒ 回退默认 + 由 `loadVisionGate` 留 warn。
+    enableThinking: boolIn(src.enableThinking, DEFAULT_VISION_GATE.enableThinking),
   };
 }
 

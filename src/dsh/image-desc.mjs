@@ -682,7 +682,12 @@ export const DEFAULT_STICKER_GATE = Object.freeze({
 });
 
 /**
- * 提示词模板（**toml 里那份和它逐字相同**；toml 留空时用这份）。
+ * 提示词模板（**照例 toml 里那份和它逐字相同**；toml 留空时用这份）。
+ *
+ * ⚠️ 2026-11-06 已知漂移：新标签 `幸灾乐祸` 的**语义分界那一段**只加在了这份代码兜底里，
+ * 线上真 toml（`<DSH_HOME>\profiles\<profile>\qq-gugu.sticker.toml` 的 `[sticker_gate] prompt`）
+ * 还没有它 —— 那次改动的边界是"不碰 `<DSH_HOME>` 的 toml"。**模型读的是 toml 那份**，
+ * 所以要真正生效，需要有人把这段同步进 toml（同一天改的那 4 条格式规则也是这么同步的）。
  *
  * ⚠️ **不要在这里手改文案**：改提示词请改 `qq-gugu.toml` 的 `[sticker_gate] prompt`
  * —— 用户点名的要求就是"提示词不能在代码里"。这份存在的唯一理由是
@@ -767,6 +772,7 @@ caption 原样抄配文，一个字都不要改、不要翻译、不要概括；
 
 【desc】用大约 {descChars} 个字说清画面里是什么（人物/物体、在做什么、周围场景）。
 【tags】只能从这个列表里选，不要造新词、不要改字：{tags}。
+【tags 的语义分界】最容易混的三个必须分清：「幸灾乐祸」= 看**别人**倒霉 / 出丑时的笑（笑的是别人，画面常常是笑着看戏），**不是安慰、也不是自嘲**；「调侃吐槽」= 嘴上损人、阴阳怪气，落点在「说」；「得意自信」= 笑自己 / 炫耀自己，落点在「我」。
 ⚠️ tags 是**数组**，**每个元素只放一个**枚举值（照抄那四个字），1-3 个，各自独立：
 - 对：["调侃吐槽","幽默搞笑","无语无奈"]（三个元素）
 - 对：["卖萌可爱"]（一个元素）
@@ -1439,6 +1445,9 @@ export function buildStickerInstruction({ frames = 0, maxDescChars = STICKER_DES
   // ⇒ 改成**每个值单独用「」括起来、顿号分隔**，并在提示词里把数组格式写死
   //    （见 {@link DEFAULT_STICKER_PROMPT} 的【tags】段，改一处要**两处一起改**：
   //     那份和 `qq-gugu.toml` 的 `[sticker_gate] prompt` 逐字相同，有测试钉着）。
+  //   ⚠️ 2026-11-06：`{tags}` 自己会跟着 `STICKER_TAGS` 变（含新增的 `幸灾乐祸`），
+  //      所以**可选列表**不需要动 toml；但 `【tags 的语义分界】` 那一段是**新加的正文**，
+  //      代码兜底有、线上 toml 还没有（那次改动不许碰 `<DSH_HOME>` 的 toml）。
   // ⚠️ 刻意**不去下游"拆斜杠"**：那要猜"哪些斜杠是分隔符"，是补下游、会引入歧义。
   fill('tags', STICKER_TAGS.map((t) => `「${t}」`).join('、'));
   fill('banned', BANNED_WORDS_IN_PROMPT.join('」「'));
@@ -1961,6 +1970,16 @@ export function createImageDescriber({
       system: detailed ? sysDetailed : sysBrief,
       instruction: describeInstruction(target, { frames }),
       maxTokens: Math.max(80, Math.ceil(target * 2)),
+      // ⭐ 2026-11-06：思考档（`[vision_gate] enableThinking`，默认 `false` = 老行为）。
+      //    **写法与「认」那条逐字一致**（`describeStickerWithVision` 里的
+      //    `reasoningEffort: gate.enableThinking ? null : 'off'`）：
+      //    `false`（默认）= `'off'`（= 加这个旋钮之前 `callVision` 的默认参数，一个字节没变）；
+      //    `true` = `null` = **不发这个字段**，让 provider 用默认档（通常就是"思考开"）。
+      //    ⚠️ `true` 时**不是**发 `reasoningEffort: 'low'`：手写进配置的模型只声明了 `off`，
+      //    发别的会直接抛 `UNSUPPORTED_REASONING_EFFORT` ⇒ 只能"不发"。
+      //    ⚠️ 它不是 `[sticker_gate] enableThinking`（那个管「认」）—— **两个键、两条路**，
+      //    别合并：一个是"转发里那张图配一句话"，一个是表情包审核，预算与用途都不同。
+      reasoningEffort: gateCfg.enableThinking ? null : 'off',
     });
     const cleaned = cleanDescription(text, descHardLimit(target));
     // ── 诚实兜底：检到"给这张图下结论"的措辞就整条丢掉 ──
@@ -2181,7 +2200,9 @@ export function createImageDescriber({
         // ⭐ 2026-10-10：思考档（`[sticker_gate] enableThinking`）。
         //    `false`（默认）= `'off'`（= 加这个旋钮之前的老行为，一个字节没变）；
         //    `true` = `null` = **不发这个字段**，让 provider 用默认档。
-        //    ⚠️ **只在「认」这一条路上动它**：转发图那句描述（`describeWithVision`）不受影响。
+        //    ⚠️ **这个键只管「认」这一条路**：转发图那句描述（`describeWithVision`）
+        //    有**自己的**键（2026-11-06 加的 `[vision_gate] enableThinking`）——
+        //    两个键各管一条路、互不影响，别把它们并成一个。
         reasoningEffort: gate.enableThinking ? null : 'off',
         // `[sticker_gate]` 写了 provider/model 就只对这一条审核调用生效。
         provider: gate.provider,
@@ -2610,6 +2631,14 @@ export function createImageDescriber({
         cloudModel: gateCfg.cloud.model,
         thresholdMiB: gateCfg.freeMiB,
         cacheMs: gateCfg.cacheMs,
+        // ⭐ 2026-11-06：「图片描述」那次调用**要不要让模型思考**（`[vision_gate] enableThinking`，
+        //    默认 `false`）。必须能在这里直接看见 —— 否则"toml 里写了到底读到没有"只能翻代码，
+        //    而这正是"配置写了却不生效"那一族坑的入口。
+        //    落盘路径：`qq-proactive-debug.json` 的 `imageDesc.visionGate.enableThinking`
+        //    （`debug-snapshot.mjs` 的 `imageDescStats` 把这一整块原样搬过去）。
+        //    ⚠️ 它和 `stickerGate.enableThinking` 是**两个键**（那条管「认」），别照着改串了。
+        //    ⚠️ 线上效果取决于 provider 路由（见 `DEFAULT_VISION_GATE.enableThinking` 那段）。
+        enableThinking: gateCfg.enableThinking,
         localCircuitOpen: localBroken,
         localFailStreak,
       },

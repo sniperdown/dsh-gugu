@@ -8,7 +8,7 @@
  *
  * ```
  * 门控说"用本地" → callVision 真的把 provider/model 换成本地
- * 门控说"用云"   → 真的换成 v4f
+ * 门控说"用云"   → 真的换成 云
  * 本地调用失败   → 真的改走云（用户要求：别让"本地优先"变成"没有视觉"）
  * 手动配了 provider → 门控**不许**插手（配置是人写的，自动化不该改它）
  * ```
@@ -76,7 +76,7 @@ const LOCAL_DECISION = {
   ageMs: 0,
   provider: 'local-llamacpp',
   model: 'qwen3.5-4b-q4km-vision',
-  cloud: { provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' },
+  cloud: { provider: 'your-provider', model: 'your-vision-model' },
   local: { provider: 'local-llamacpp', model: 'qwen3.5-4b-q4km-vision' },
 };
 
@@ -85,8 +85,8 @@ const CLOUD_DECISION = {
   use: 'cloud',
   reason: 'vram-low',
   freeMiB: 3000,
-  provider: 'discovery-intern-ai',
-  model: 'deepseek-v4-flash-vision',
+  provider: 'your-provider',
+  model: 'your-vision-model',
 };
 
 /** 造一个带门控的描述器。 */
@@ -122,12 +122,12 @@ test('★★ 门控说"用本地" ⇒ 这次视觉调用真的发给本地 provi
   assert.equal(desc.stats().visionGate.last.freeMiB, 9000);
 });
 
-test('★★ 门控说"用云" ⇒ 这次视觉调用真的发给 v4f，而且计数记在 cloudLowVram 上', async () => {
+test('★★ 门控说"用云" ⇒ 这次视觉调用真的发给 云，而且计数记在 cloudLowVram 上', async () => {
   const stream = fakeStream();
   const desc = makeDescriber({ gate: fakeGate(CLOUD_DECISION), stream });
   await desc.describe(IMAGE_INPUT);
   assert.deepEqual(stream.calls, [
-    { provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' },
+    { provider: 'your-provider', model: 'your-vision-model' },
   ]);
   const st = desc.stats().visionGate;
   assert.equal(st.cloudLowVram, 1);
@@ -154,7 +154,7 @@ test('★★ 本地调用失败 ⇒ **同一次**调用改走云（用户要求�
   assert.equal(text, '云看出来了：一只猫');
   assert.deepEqual(stream.calls, [
     { provider: 'local-llamacpp', model: 'qwen3.5-4b-q4km-vision' },
-    { provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' },
+    { provider: 'your-provider', model: 'your-vision-model' },
   ]);
   const st = desc.stats().visionGate;
   assert.equal(st.localFailed, 1);
@@ -175,7 +175,7 @@ test('★★ 本地连续失败 3 次 ⇒ 熔断：第 4 条**连试都不试**�
   stream.calls.length = 0;
   await desc.describe({ ...IMAGE_INPUT, name: 'd.png' });
   assert.deepEqual(stream.calls, [
-    { provider: 'discovery-intern-ai', model: 'deepseek-v4-flash-vision' },
+    { provider: 'your-provider', model: 'your-vision-model' },
   ], '熔断之后不该再去碰本地（否则每条图消息都白等一次本地超时）');
   const st = desc.stats().visionGate;
   assert.equal(st.localAttempts !== undefined ? st.localAttempts : 0, 0);
@@ -233,11 +233,11 @@ test('★ 手动只写了一半（只给 model）⇒ 缺的那半沿用手动侧
   const desc = makeDescriber({
     gate: fakeGate(LOCAL_DECISION),
     stream,
-    stickerGate: { provider: '', model: 'deepseek-v4-flash-vision' },
+    stickerGate: { provider: '', model: 'your-vision-model' },
   });
   await desc.describeSticker({ data: PNG_BYTES, mediaType: 'image/png', name: 's.png' });
   assert.deepEqual(stream.calls, [
-    { provider: 'deepseek-official', model: 'deepseek-v4-flash-vision' },
+    { provider: 'deepseek-official', model: 'your-vision-model' },
   ]);
 });
 
@@ -251,8 +251,8 @@ test('调试快照里能看出"门控开没开 / 阈值 / 本地配了哪条"（
   assert.equal(st.cacheMs, 5000);
   assert.equal(st.localProvider, 'local-llamacpp');
   assert.equal(st.localModel, 'qwen3.5-4b-q4km-vision');
-  assert.equal(st.cloudProvider, 'discovery-intern-ai');
-  assert.equal(st.cloudModel, 'deepseek-v4-flash-vision');
+  assert.equal(st.cloudProvider, 'your-provider');
+  assert.equal(st.cloudModel, 'your-vision-model');
   assert.equal(st.localCircuitOpen, false);
   assert.equal(st.localFailStreak, 0);
   // 计数器全都在（缺字段会让调试快照看不出"到底哪条路在跑"）
@@ -267,7 +267,7 @@ test('门控关闭时，统计快照**不许**谎报本地/云的名字（会误
   const st = desc.stats().visionGate;
   assert.equal(st.enabled, false);
   assert.equal(st.localProvider, '');
-  assert.equal(st.cloudProvider, 'discovery-intern-ai', '没配门控时这里报的是代码默认的云');
+  assert.equal(st.cloudProvider, 'your-provider', '没配门控时这里报的是代码默认的云');
 });
 
 // ─────────────────────────────────────────────── 审核留样（sticker-audit 接线）

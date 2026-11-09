@@ -94,11 +94,8 @@ import { GIF_6FRAMES } from './fixtures/gif-bytes.mjs';
  * ⚠️ 2026-10-30：`[sticker_gate]` 已拆到 `qq-gugu.sticker.toml`。这里要问解析器
  * "这一刻加载器会读哪份"，别再直接拼主文件路径 —— 否则拆完就读到空提示词。
  */
-// ⚠️ 2026-11-05（开源版）：这条是**集成用例**，钉的是"部署里那份 toml 的提示词
-//    与代码兜底是否一致"。公开仓库里没有部署配置，所以默认跳过；
-//    要看它跑，设 `QQ_GUGU_TOML=<你自己的 qq-gugu.toml>`。
-const MAIN_TOML = process.env.QQ_GUGU_TOML ?? '';
-const REAL_TOML = MAIN_TOML === '' ? '' : resolveModelToml(MAIN_TOML, 'sticker').path;
+const MAIN_TOML = process.env.QQ_GUGU_TOML ?? '<DSH_HOME>/profiles/<profile>/qq-gugu.toml';
+const REAL_TOML = resolveModelToml(MAIN_TOML, 'sticker').path;
 
 /** 一份合法的 PNG 头（`sniffImageMediaType` 认得出）。 */
 const PNG_BYTES = new Uint8Array([
@@ -977,13 +974,19 @@ test('★★ enableThinking 进了留样（侧车 json **和 index.jsonl** 都�
 
 test('★ enableThinking 只管「认」那条路：转发图那句描述（describe）照旧 reasoningEffort=off', async () => {
   // 「认」开着思考不该把"转发里夹着的图"那句描述也带跑偏 —— 那是另一条路、另一种预算。
+  // ⚠️ 2026-11-06 补：描述那条路现在**也有**自己的开关了（`[vision_gate] enableThinking`，
+  //    默认 false）。这条测试钉的是"**「认」的键不许漏到描述路上**" ——
+  //    这里 `[vision_gate]` 一个字都没配 ⇒ 描述仍然是 `'off'`。
   const stream = fakeStream('一只橘猫趴在键盘上');
   const describer = createImageDescriber({
     attachments: fakeAttachments(), stream, fetchImpl: okFetch,
     stickerGate: { enableThinking: true },
   });
   await describer.describe({ data: PNG_BYTES, mediaType: 'image/png' });
-  assert.equal(stream.calls[0].reasoningEffort, 'off', '描述那条路**没有**思考开关，永远是 off');
+  assert.equal(
+    stream.calls[0].reasoningEffort, 'off',
+    '「认」的 enableThinking 不许影响描述那条路（它读的是 [vision_gate] 那个键，没配就是 off）',
+  );
 });
 
 test('★★ 钉住"两个列表一一对应"：normalizeStickerGate 会夹的键 ⊂ loadStickerGate 的 warn 列表', async () => {

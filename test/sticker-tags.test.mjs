@@ -32,23 +32,36 @@ import {
   normalizeStickerTags,
 } from '../src/dsh/sticker-tags.mjs';
 
-// ------------------------------------------------------------------ 17 个枚举
+// ------------------------------------------------------------------ 18 个枚举
 
-test('★★ 枚举正好是 17 个值，一个字都不能差（顺序也是契约）', () => {
-  // 顺序 = 报告 §2.2 的表格顺序（按真实使用次数降序）。
+test('★★ 枚举正好是 18 个值，一个字都不能差（顺序也是契约）', () => {
+  // 顺序 = 报告 §2.2 的表格顺序（按真实使用次数降序），末尾追加的新标签排最后。
   // 它不是"随便排的"：覆盖率表、提示词示例、以及"挑"的展示顺序都按它。
   assert.deepEqual([...STICKER_TAGS], [
     '调侃吐槽', '幽默搞笑', '卖萌可爱', '震惊惊讶', '无语无奈', '害羞心动', '玩梗接梗',
     '开心满足', '治愈陪伴', '困惑不解', '尴尬社死', '得意自信', '社交互动', '难过不安',
-    '吃瓜围观', '生气不满', '赞同支持',
+    '吃瓜围观', '生气不满', '赞同支持', '幸灾乐祸',
   ]);
-  assert.equal(STICKER_TAGS.length, 17);
-  assert.equal(new Set(STICKER_TAGS).size, 17, '不该有重复');
+  assert.equal(STICKER_TAGS.length, 18);
+  assert.equal(new Set(STICKER_TAGS).size, 18, '不该有重复');
   assert.equal(STICKER_TAG_FALLBACK, '其他');
   assert.equal(STICKER_TAGS.includes(STICKER_TAG_FALLBACK), false, '「其他」不进可选列表');
   assert.equal(MAX_STICKER_TAGS, 3);
   assert.equal(MAX_UNMATCHED_CHARS, 8);
   assert.equal(Object.isFrozen(STICKER_TAGS), true, '枚举要冻结：它是契约');
+});
+
+test('★★ 2026-11-06 新增的 `幸灾乐祸` 必须在枚举里（标注可用、模型可选）', () => {
+  // 为什么单独钉：`sticker-tags.mjs` 原本是生成物，重新生成会**静默抹掉**手工追加的项。
+  // 而它一旦消失，人工标注页就没有这个胶囊（模型也永远选不出来）——
+  // 表现只是"某类图没标签"，不会报错。
+  assert.equal(STICKER_TAGS.includes('幸灾乐祸'), true, '枚举里必须有「幸灾乐祸」');
+  assert.equal(STICKER_TAGS[STICKER_TAGS.length - 1], '幸灾乐祸', '追加项排最后，前 17 个顺序不动');
+  assert.equal(isStickerTag('幸灾乐祸'), true, '它要能通过入库校验（否则会被 normalizeStickerTags 丢掉）');
+  assert.equal(isStickerTag('  幸灾乐祸 '), true, '去首尾空白后也认');
+  // 与它最像的两个老标签不能被顺带改名/删掉（"分界"是三个词的语义差）
+  assert.equal(isStickerTag('调侃吐槽'), true);
+  assert.equal(isStickerTag('得意自信'), true);
 });
 
 test('★★ `治愈陪伴` 这个名字不能回退成旧的 `关心安慰`', () => {
@@ -61,16 +74,20 @@ test('★★ `治愈陪伴` 这个名字不能回退成旧的 `关心安慰`', (
   assert.equal(EMOJI_TAG_MAP['亲密调侃'], '治愈陪伴');
 });
 
-test('覆盖率表：18 个键（17 + 其他），17 个加起来 ≈ 98.93%', () => {
-  assert.equal(Object.keys(STICKER_TAG_COVERAGE).length, 18);
+test('覆盖率表：19 个键（18 + 其他），18 个加起来 ≈ 98.93%', () => {
+  assert.equal(Object.keys(STICKER_TAG_COVERAGE).length, 19);
   for (const tag of STICKER_TAGS) {
     assert.equal(typeof STICKER_TAG_COVERAGE[tag], 'number', `${tag} 缺覆盖率`);
   }
   assert.equal(STICKER_TAG_COVERAGE[STICKER_TAG_FALLBACK], 1.07);
+  // 新标签**没有历史数据** ⇒ 覆盖率是 0（不是估算的小数；口径是改之前那 30458 个标签实例）
+  assert.equal(STICKER_TAG_COVERAGE['幸灾乐祸'], 0, '新标签的历史占比必须是 0');
   // 报告口径 A（30458 个标签实例）里逐项四舍五入后相加 = 98.92，报告写 98.93。
+  // ⚠️ 加第 18 个标签后总数**不该变**（新的那个是 0）—— 这条同时钉住了
+  //    "别再用 `i < 17` 按位置截"那个写法：那种写法会让总数静默掉到 97.68。
   assert.ok(
     STICKER_TAG_COVERAGE_TOTAL >= 98.5 && STICKER_TAG_COVERAGE_TOTAL <= 99.5,
-    `17 个桶该覆盖 ~98.93%，实际 ${STICKER_TAG_COVERAGE_TOTAL}`,
+    `18 个桶该覆盖 ~98.93%，实际 ${STICKER_TAG_COVERAGE_TOTAL}`,
   );
   // 抽样：占最大头的那两个 + 最小的那一个
   assert.equal(STICKER_TAG_COVERAGE['调侃吐槽'], 16.69);
@@ -78,13 +95,16 @@ test('覆盖率表：18 个键（17 + 其他），17 个加起来 ≈ 98.93%', (
   assert.equal(STICKER_TAG_COVERAGE['赞同支持'], 1.24);
 });
 
-test('匹配优先级：17 个值、与枚举同集合、而且「其他」不在里面', () => {
-  assert.equal(STICKER_TAG_PRIORITY.length, 17);
+test('匹配优先级：18 个值、与枚举同集合、而且「其他」不在里面', () => {
+  assert.equal(STICKER_TAG_PRIORITY.length, 18);
   assert.deepEqual([...STICKER_TAG_PRIORITY].sort(), [...STICKER_TAGS].sort());
   assert.equal(STICKER_TAG_PRIORITY.includes(STICKER_TAG_FALLBACK), false);
   // 方案 A「情绪反应优先」的头两个（数据源里的 order[0]/[1]）
   assert.equal(STICKER_TAG_PRIORITY[0], '尴尬社死');
   assert.equal(STICKER_TAG_PRIORITY[1], '生气不满');
+  // 新标签没有历史原标签能映射进来 ⇒ 排最后，且老映射结果一个都不变
+  assert.equal(STICKER_TAG_PRIORITY[STICKER_TAG_PRIORITY.length - 1], '幸灾乐祸');
+  assert.equal(EMOJI_TAG_MAP['阴阳怪气'], '调侃吐槽', '老映射不受影响');
 });
 
 test('高频标签示例：每个桶都有、都不超过 3 个、都非空', () => {
@@ -99,7 +119,7 @@ test('高频标签示例：每个桶都有、都不超过 3 个、都非空', ()
 
 // ------------------------------------------------------------------ 1685 映射表
 
-test('★★ 映射表正好 1685 条，值域只有 18 个（17 枚举 + 其他）', () => {
+test('★★ 映射表正好 1685 条，值域只有 19 个（18 枚举 + 其他）', () => {
   const keys = Object.keys(EMOJI_TAG_MAP);
   assert.equal(keys.length, 1685);
   assert.equal(EMOJI_TAG_MAP_META.size, 1685);
@@ -157,7 +177,7 @@ test('★ 抽样点：短语、长句、以及"落进其他"的那一类', () =>
 
 // ------------------------------------------------------------------ 纯函数
 
-test('isStickerTag：只认 17 个枚举值（「其他」不算，近似词不算）', () => {
+test('isStickerTag：只认 18 个枚举值（「其他」不算，近似词不算）', () => {
   assert.equal(isStickerTag('调侃吐槽'), true);
   assert.equal(isStickerTag('  卖萌可爱  '), true, '去首尾空白');
   assert.equal(isStickerTag('其他'), false, '兜底桶不可选');

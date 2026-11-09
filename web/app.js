@@ -26,7 +26,7 @@
  * ## 心跳
  *
  * 页面每 5 秒 `POST /heartbeat` 一次。**不判断 `document.hidden`**：切走标签页
- * 就不发心跳的话，服务会在 15 秒后自行关闭，回来时页面已经是个死页。
+ * 就不发心跳的话，服务会在 120 秒后自行关闭，回来时页面已经是个死页。
  * 页面重新可见时再补发一次，用于抵消浏览器对后台页面定时器的节流。
  *
  * ## 写入（2026-10-28：合并成「保存全部」）
@@ -75,7 +75,7 @@ const TOKEN_PARAM = 't';
 /** 令牌的请求头名（服务端按小写读取）。 */
 const TOKEN_HEADER = 'x-config-token';
 
-/** 心跳间隔：5 秒。服务端 15 秒没有心跳就关闭。 */
+/** 心跳间隔：5 秒。服务端 120 秒没有心跳就关闭。 */
 const HEARTBEAT_MS = 5000;
 
 /** 页面用到的两个既有 HTTP 路由；服务端把它们原样挂到临时服务上。 */
@@ -128,6 +128,9 @@ const TABS = [
   { id: 'mood', label: '心情', file: 'mood' },
   { id: 'vision', label: '识图', file: 'vision' },
   { id: 'sticker', label: '表情包', file: 'sticker' },
+  // 「表情标注」= 人工复标一小批表情包，量模型给的 tags / desc 准不准（2026-11-06）。
+  // 它不是配置项页（不写 toml、不参与「保存全部」），数据走自己的五条 HTTP 路由。
+  { id: 'annotate', label: '表情标注' },
   // 「语音」= 入站一条链（转写 `[voice]` + 情绪 `[emotion]`，同一个文件）＋出站 `[tts]`。
   // 出站为什么单独一个文件：换音色和换转写模型互不相干，合在一起回滚会连坐。
   { id: 'voice', label: '语音', files: ['voice', 'tts'] },
@@ -272,6 +275,35 @@ function createApp({ h, logic, React }) {
     const [backupState, setBackupState] = useState({ files: {}, error: '', busy: false });
     /** 「提示词」页的最终提示词预览（2026-10-30）：`{data, loading, error}`。 */
     const [promptPreview, setPromptPreview] = useState({ data: null, loading: false, error: '' });
+    /**
+     * 「表情标注」页（2026-11-06）。**独立于配置草稿表**：这里标的是
+     * `qq-stickers.json` 里的人工字段，不写 toml、不进「保存全部」。
+     *
+     * - `items`：当前这一批（默认 12 张），每项带模型原判与已有的人工结果；
+     * - `drafts`：按 md5 存**本页正在编辑**的值（标签 / 描述 / 三档 / 保存状态）；
+     * - `report`：准确率汇总（点「计算准确率」才拉，避免每标一张都打一次接口）。
+     */
+    const [annotate, setAnnotate] = useState({
+      loaded: false,
+      loading: false,
+      error: '',
+      size: 12,
+      sizeText: '12',
+      cursor: 0,
+      nextCursor: 0,
+      total: 0,
+      annotated: 0,
+      poolSize: 0,
+      freshOnly: false,
+      items: [],
+      tagOptions: [],
+      verdictOptions: [],
+      drafts: {},
+      savingAll: false,
+      report: null,
+      reportLoading: false,
+      reportError: '',
+    });
     const [service, setService] = useState({ state: 'connecting', port: 0, error: '' });
 
     // ---- 「通道 / 原文件」共用的写入状态 ----
@@ -574,6 +606,247 @@ function createApp({ h, logic, React }) {
       if (activeTab !== 'prompt') return;
       if (promptPreview.data !== null || promptPreview.loading) return;
       loadPromptPreview();
+    }, [activeTab]);
+
+    // ---------------- 表情标注（2026-11-06） ----------------
+    //
+    // 目的：量模型给表情包打的 tags / 写的 desc 准不准。人工逐张复标一小批，
+    // 再看对上了多少。**只写 `manual*` 字段，绝不改 `tags` / `desc`**（那是被评估的对象）。
+
+    /** 这五条路由的前缀（与 `src/dsh/sticker-labeling.mjs` 的 `STICKER_LABEL_ROUTE_BASE` 一致）。 */
+    const ANNOTATE_BASE = '/dsh-qq-proactive/sticker-label';
+
+    /**
+     * 图片地址。`<img>` 带不了自定义请求头，令牌只能拼进查询参数 ——
+     * 这与页面自己的静态资源（`/style.css?t=…`）是同一个做法，不是新机制。
+     */
+    function annotateImageSrc(md5) {
+      return `${ANNOTATE_BASE}/image?md5=${encodeURIComponent(md5)}&t=${encodeURIComponent(TOKEN)}`;
+    }
+
+    /** 导出地址（后端带 `content-disposition`，点了就下载）。同样只能把令牌拼进地址。 */
+    function annotateExportHref() {
+      return `${ANNOTATE_BASE}/export?t=${encodeURIComponent(TOKEN)}`;
+    }
+
+    /**
+     * 比率显示成百分比。`null` 一律显示成 `—`：
+     * "还没标" 与 "标了 0%" 是两件事，不能用同一个 `0%` 糊过去。
+     */
+    function annotatePct(value) {
+      return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value * 100)}%` : '—';
+    }
+
+    /**
+     * 保存时间显示成**本地**时间（`manualAt` 是 ISO/UTC，直接切字符串会差 8 小时）。
+     * 解析不出来就返回空串 —— 宁可只显示"已保存"，不显示一个错的时间。
+     */
+    function annotateSavedAtText(iso) {
+      const text = logic.textOf(iso);
+      if (text === '') return '';
+      try {
+        const date = new Date(text);
+        if (!Number.isFinite(date.getTime())) return '';
+        return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+      } catch {
+        return '';
+      }
+    }
+
+    /** 某一张的编辑草稿：没编辑过就按条目里已有的人工结果铺一份（不写进 state）。 */
+    function annotateDraftOf(item, store) {
+      const drafts = store ?? annotate.drafts;
+      const existing = drafts[item.md5];
+      if (existing !== undefined) return existing;
+      return {
+        tags: Array.isArray(item.manualTags) ? [...item.manualTags] : [],
+        desc: typeof item.manualDesc === 'string' ? item.manualDesc : '',
+        verdict: typeof item.manualVerdict === 'string' ? item.manualVerdict : '',
+        saving: false,
+        error: '',
+        dirty: false,
+        savedAt: typeof item.manualAt === 'string' ? item.manualAt : '',
+      };
+    }
+
+    /** 改某一张的草稿（`dirty` 置上；保存成功后由保存那条路清掉）。 */
+    function patchAnnotateDraft(md5, patch) {
+      setAnnotate((prev) => {
+        const item = prev.items.find((candidate) => candidate.md5 === md5);
+        if (item === undefined) return prev;
+        const base = annotateDraftOf(item, prev.drafts);
+        return {
+          ...prev,
+          drafts: { ...prev.drafts, [md5]: { ...base, ...patch, dirty: true, error: '' } },
+        };
+      });
+    }
+
+    /**
+     * 抽一批（默认 12 张）。
+     *
+     * 有任何未保存的改动时先问一句：换一批会把本页草稿丢掉（草稿只在页面里，
+     * 没落库就等于没标）。已保存的不会丢，它们已经写进 `qq-stickers.json` 了。
+     */
+    async function loadAnnotate(options = {}) {
+      const wantedSize = Number.isFinite(Number(options.size)) ? Number(options.size) : annotate.size;
+      const wantedCursor = Number.isFinite(Number(options.cursor)) ? Number(options.cursor) : 0;
+      setAnnotate((prev) => ({ ...prev, loading: true, error: '' }));
+      try {
+        const query = `size=${encodeURIComponent(wantedSize)}&cursor=${encodeURIComponent(wantedCursor)}`;
+        const data = await api(`${ANNOTATE_BASE}/batch?${query}`);
+        if (data === null || data.ok !== true) {
+          throw new Error(data !== null && typeof data.error === 'string' ? data.error : '读取标注批次失败');
+        }
+        setAnnotate((prev) => ({
+          ...prev,
+          loaded: true,
+          loading: false,
+          error: '',
+          size: Number.isFinite(Number(data.size)) ? Number(data.size) : wantedSize,
+          sizeText: String(Number.isFinite(Number(data.size)) ? Number(data.size) : wantedSize),
+          cursor: Number.isFinite(Number(data.cursor)) ? Number(data.cursor) : wantedCursor,
+          nextCursor: Number.isFinite(Number(data.nextCursor)) ? Number(data.nextCursor) : wantedCursor + 1,
+          total: Number.isFinite(Number(data.total)) ? Number(data.total) : 0,
+          annotated: Number.isFinite(Number(data.annotated)) ? Number(data.annotated) : 0,
+          poolSize: Number.isFinite(Number(data.poolSize)) ? Number(data.poolSize) : 0,
+          freshOnly: data.freshOnly === true,
+          items: Array.isArray(data.items) ? data.items : [],
+          tagOptions: Array.isArray(data.tagOptions) ? data.tagOptions : [],
+          verdictOptions: Array.isArray(data.verdictOptions) ? data.verdictOptions : [],
+          drafts: {},
+          report: null,
+          reportError: '',
+        }));
+      } catch (error) {
+        setAnnotate((prev) => ({ ...prev, loading: false, error: errorText(error) }));
+      }
+    }
+
+    /**
+     * 保存一张的人工标注。
+     *
+     * `override` 用来"改完立刻存"（点三档按钮时把这一下的值直接带上，
+     * 不依赖 setState 之后的下一次渲染）。失败只落在这一张的 `error` 上，不弹整页错误。
+     *
+     * @returns {Promise<boolean>} 是否写入成功
+     */
+    async function saveAnnotateOne(md5, override) {
+      const item = annotate.items.find((candidate) => candidate.md5 === md5);
+      const draft = item === undefined ? null : annotateDraftOf(item);
+      const tags = override !== undefined && Array.isArray(override.tags)
+        ? override.tags
+        : (draft !== null ? draft.tags : []);
+      const desc = override !== undefined && typeof override.desc === 'string'
+        ? override.desc
+        : (draft !== null ? draft.desc : '');
+      const verdict = override !== undefined && typeof override.verdict === 'string'
+        ? override.verdict
+        : (draft !== null ? draft.verdict : '');
+      if (tags.length === 0 && String(desc).trim() === '' && verdict === '') return false;
+
+      setAnnotate((prev) => {
+        const current = prev.items.find((candidate) => candidate.md5 === md5);
+        if (current === undefined) return prev;
+        const base = annotateDraftOf(current, prev.drafts);
+        return { ...prev, drafts: { ...prev.drafts, [md5]: { ...base, saving: true, error: '' } } };
+      });
+      try {
+        const result = await api(`${ANNOTATE_BASE}/save`, {
+          method: 'POST',
+          body: { md5, manualTags: tags, manualDesc: desc, manualVerdict: verdict },
+        });
+        if (result === null || result.ok !== true) {
+          throw new Error(result !== null && typeof result.error === 'string' ? result.error : '保存失败');
+        }
+        setAnnotate((prev) => {
+          const before = prev.items.find((candidate) => candidate.md5 === md5);
+          const already = before !== undefined && logic.textOf(before.manualAt) !== '';
+          return {
+            ...prev,
+            annotated: prev.annotated + (already ? 0 : 1),
+            items: prev.items.map((candidate) => (candidate.md5 === md5
+              ? {
+                ...candidate,
+                manualTags: Array.isArray(result.manualTags) ? result.manualTags : tags,
+                manualDesc: typeof result.manualDesc === 'string' ? result.manualDesc : desc,
+                manualVerdict: typeof result.manualVerdict === 'string' ? result.manualVerdict : verdict,
+                manualAt: typeof result.manualAt === 'string' ? result.manualAt : candidate.manualAt,
+                modelTags: Array.isArray(result.modelTags) ? result.modelTags : candidate.modelTags,
+                modelDesc: typeof result.modelDesc === 'string' ? result.modelDesc : candidate.modelDesc,
+                annotated: true,
+              }
+              : candidate)),
+            drafts: {
+              ...prev.drafts,
+              [md5]: {
+                tags: Array.isArray(result.manualTags) ? result.manualTags : tags,
+                desc: typeof result.manualDesc === 'string' ? result.manualDesc : desc,
+                verdict: typeof result.manualVerdict === 'string' ? result.manualVerdict : verdict,
+                saving: false,
+                error: '',
+                dirty: false,
+                savedAt: typeof result.manualAt === 'string' ? result.manualAt : new Date().toISOString(),
+              },
+            },
+          };
+        });
+        return true;
+      } catch (error) {
+        const base = draft ?? {
+          tags, desc, verdict, saving: false, dirty: true, savedAt: '',
+        };
+        setAnnotate((prev) => ({
+          ...prev,
+          drafts: {
+            ...prev.drafts,
+            [md5]: { ...base, saving: false, error: errorText(error) },
+          },
+        }));
+        return false;
+      }
+    }
+
+    /** 换批前提醒：本页草稿只在内存里，没保存就换批 = 直接丢了。 */
+    function confirmDiscardAnnotateDrafts() {
+      const dirty = Object.values(annotate.drafts).some((draft) => draft.dirty === true);
+      if (!dirty) return true;
+      if (typeof window.confirm !== 'function') return true;
+      return window.confirm('还有没保存的标注，换一批就会丢掉它们。继续？');
+    }
+
+    /** 保存本页所有"改过但没存"的卡片（串行，避免同一条素材两次写库互相覆盖）。 */
+    async function saveAnnotateAll() {
+      const pending = annotate.items
+        .map((item) => ({ item, draft: annotate.drafts[item.md5] }))
+        .filter((entry) => entry.draft !== undefined && entry.draft.dirty === true);
+      if (pending.length === 0) return;
+      setAnnotate((prev) => ({ ...prev, savingAll: true }));
+      for (const { item, draft } of pending) {
+        await saveAnnotateOne(item.md5, { tags: draft.tags, desc: draft.desc, verdict: draft.verdict });
+      }
+      setAnnotate((prev) => ({ ...prev, savingAll: false }));
+    }
+
+    /** 拉准确率汇总（只读；点按钮才拉，不跟着每次保存走）。 */
+    async function loadAnnotateReport() {
+      setAnnotate((prev) => ({ ...prev, reportLoading: true, reportError: '' }));
+      try {
+        const data = await api(`${ANNOTATE_BASE}/report`);
+        if (data === null || data.ok !== true) {
+          throw new Error(data !== null && typeof data.error === 'string' ? data.error : '读取报告失败');
+        }
+        setAnnotate((prev) => ({ ...prev, reportLoading: false, report: data, reportError: '' }));
+      } catch (error) {
+        setAnnotate((prev) => ({ ...prev, reportLoading: false, reportError: errorText(error) }));
+      }
+    }
+
+    // 切到「表情标注」页且还没拉过 ⇒ 自动拉第一批（和「提示词」页同一个套路）。
+    useEffect(() => {
+      if (activeTab !== 'annotate') return;
+      if (annotate.loaded || annotate.loading) return;
+      loadAnnotate({ size: annotate.size, cursor: 0 });
     }, [activeTab]);
 
 
@@ -1505,6 +1778,375 @@ function createApp({ h, logic, React }) {
     }
 
     /**
+     * 渲染「表情标注」页（2026-11-06）。
+     *
+     * 一屏 `size` 张（默认 12）：左边图片、右边模型原判，下面 17 个标签 + 一句人工描述 +
+     * 三档判词。下方是准确率汇总（点「计算准确率」才拉）。
+     *
+     * ⚠️ **这一页对素材只读**：不提供任何"改模型结果"或"移除这张"的地方 —— 它只写 `manual*`。
+     * `tags` / `desc` 一个字节都不碰（那是被评估的对象）。
+     */
+    function renderAnnotateTab() {
+      const verdictOptions = annotate.verdictOptions.length > 0
+        ? annotate.verdictOptions
+        : ['对', '半对', '错'];
+      const tagOptions = annotate.tagOptions;
+      const itemModelTags = (item) => (Array.isArray(item.modelTags) && item.modelTags.length > 0
+        ? item.modelTags
+        : (Array.isArray(item.tags) ? item.tags : []));
+      const itemModelDesc = (item) => (logic.textOf(item.modelDesc) !== '' ? item.modelDesc : item.desc);
+
+      function renderAnnotateCard(item, index) {
+        const draft = annotateDraftOf(item);
+        const modelTags = itemModelTags(item);
+        const modelDesc = itemModelDesc(item);
+        const manualTags = Array.isArray(draft.tags) ? draft.tags : [];
+        const status = draft.error !== ''
+          ? h('span', { className: 'error' }, draft.error)
+          : draft.saving === true
+            ? h('span', { className: 'hint' }, '保存中…')
+            : draft.dirty === true
+              ? h('span', { className: 'hint-warn' }, '未保存')
+              : logic.textOf(draft.savedAt) !== ''
+                ? h(
+                  'span',
+                  { className: 'hint-ok' },
+                  `已保存${annotateSavedAtText(draft.savedAt) === '' ? '' : ` ${annotateSavedAtText(draft.savedAt)}`}`,
+                )
+                : null;
+        return h(
+          'div',
+          { key: item.md5, className: 'card annotate-card' },
+          h(
+            'div',
+            { className: 'annotate-head' },
+            h(
+              'div',
+              { className: 'annotate-thumb-box' },
+              h('img', {
+                className: 'annotate-thumb',
+                src: annotateImageSrc(item.md5),
+                alt: `第 ${index + 1} 张表情包`,
+                loading: 'lazy',
+              }),
+              h('div', { className: 'hint annotate-id' }, `${index + 1}. ${logic.textOf(item.file)}`),
+            ),
+            h(
+              'div',
+              { className: 'annotate-model' },
+              h('div', { className: 'card-title' }, '模型原判'),
+              h(
+                'div',
+                { className: 'annotate-tags' },
+                modelTags.length === 0
+                  ? h('span', { className: 'hint' }, '（模型没给标签）')
+                  : modelTags.map((tag) => h('span', { key: tag, className: 'chip chip-model' }, tag)),
+              ),
+              h('div', { className: 'hint' }, `描述：${logic.textOf(modelDesc) === '' ? '（空）' : modelDesc}`),
+              logic.textOf(item.manualAt) !== ''
+                ? h('div', { className: 'hint' }, '这张标过 —— 再存只会更新人工结果，模型基准不变。')
+                : null,
+            ),
+          ),
+          h(
+            'div',
+            { className: 'annotate-tag-pick' },
+            tagOptions.map((tag) => h(
+              'label',
+              { key: tag, className: `chip-check${manualTags.includes(tag) ? ' chip-check-on' : ''}` },
+              h('input', {
+                type: 'checkbox',
+                checked: manualTags.includes(tag),
+                onChange: (event) => {
+                  const next = event.target.checked
+                    ? tagOptions.filter((candidate) => candidate === tag || manualTags.includes(candidate))
+                    : manualTags.filter((candidate) => candidate !== tag);
+                  patchAnnotateDraft(item.md5, { tags: next });
+                },
+              }),
+              tag,
+            )),
+          ),
+          h('input', {
+            className: 'input',
+            type: 'text',
+            maxLength: 200,
+            placeholder: '人工描述（一句：这张图在表达什么）',
+            value: typeof draft.desc === 'string' ? draft.desc : '',
+            onChange: (event) => patchAnnotateDraft(item.md5, { desc: event.target.value }),
+          }),
+          h(
+            'div',
+            { className: 'actions' },
+            h('span', { className: 'hint' }, '模型判得：'),
+            ...verdictOptions.map((verdict) => h(
+              'button',
+              {
+                key: verdict,
+                type: 'button',
+                className: `button${draft.verdict === verdict ? ' button-primary' : ''}`,
+                'aria-pressed': draft.verdict === verdict,
+                disabled: draft.saving === true,
+                onClick: () => {
+                  // 点三档 = 这一张标完了：把当前标签/描述连着判词一起存掉。
+                  patchAnnotateDraft(item.md5, { verdict });
+                  saveAnnotateOne(item.md5, {
+                    tags: manualTags,
+                    desc: typeof draft.desc === 'string' ? draft.desc : '',
+                    verdict,
+                  });
+                },
+              },
+              verdict,
+            )),
+          ),
+          h(
+            'div',
+            { className: 'actions' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'button',
+                disabled: draft.saving === true,
+                onClick: () => { saveAnnotateOne(item.md5); },
+              },
+              '保存这张',
+            ),
+            status,
+          ),
+        );
+      }
+
+      function renderAnnotateReport() {
+        if (annotate.reportError !== '') {
+          return h(
+            'div',
+            { className: 'card' },
+            h('div', { className: 'card-title' }, '准确率汇总'),
+            h('div', { className: 'field-error' }, annotate.reportError),
+          );
+        }
+        const report = annotate.report;
+        if (report === null) return null;
+        const accuracy = report.accuracy !== null && typeof report.accuracy === 'object'
+          ? report.accuracy
+          : {};
+        const verdicts = accuracy.verdicts !== null && typeof accuracy.verdicts === 'object'
+          ? accuracy.verdicts
+          : { 对: 0, 半对: 0, 错: 0 };
+        const perTag = (Array.isArray(accuracy.perTag) ? accuracy.perTag : [])
+          .filter((row) => row !== null && (row.manual > 0 || row.model > 0));
+        const otherTags = Array.isArray(accuracy.otherTags) ? accuracy.otherTags : [];
+        const head = ['标签', '人工', '命中', '命中率', '模型', '多余', '多余率'];
+
+        return h(
+          'div',
+          { key: 'annotate-report', className: 'card' },
+          h('div', { className: 'card-title' }, '准确率汇总'),
+          h(
+            'div',
+            { className: 'hint' },
+            `已人工标注 ${report.annotated ?? 0} 张（全库 ${report.total ?? 0} 张）。`
+              + '「命中」= 你勾的标签里模型也给了；「多余」= 模型给了你没勾。',
+          ),
+          h(
+            'div',
+            { className: 'hint' },
+            `标签级：人工标签 ${accuracy.manualTagTotal ?? 0} 个，被模型命中 ${accuracy.manualTagHit ?? 0} 个`
+              + `（命中率 ${annotatePct(accuracy.tagRecall)}，漏掉 ${accuracy.manualTagMiss ?? 0} 个）；`
+              + `模型标签 ${accuracy.modelTagTotal ?? 0} 个，多余 ${accuracy.modelTagExtra ?? 0} 个`
+              + `（多余率 ${annotatePct(accuracy.tagExtraRate)}，精确率 ${annotatePct(accuracy.tagPrecision)}）。`,
+          ),
+          h(
+            'div',
+            { className: 'hint' },
+            `描述三档：对 ${verdicts.对 ?? 0} 张 · 半对 ${verdicts.半对 ?? 0} 张 · 错 ${verdicts.错 ?? 0} 张`
+              + `（严格准确率 ${annotatePct(accuracy.verdictStrict)}，半对折半 ${annotatePct(accuracy.verdictSoft)}）。`,
+          ),
+          perTag.length === 0
+            ? null
+            : h(
+              'div',
+              { className: 'annotate-table' },
+              h(
+                'div',
+                { className: 'annotate-row annotate-row-head' },
+                ...head.map((label) => h('span', { key: `head-${label}` }, label)),
+              ),
+              ...perTag.map((row) => h(
+                'div',
+                { key: row.tag, className: 'annotate-row' },
+                h('span', null, row.tag),
+                h('span', null, String(row.manual)),
+                h('span', null, String(row.hit)),
+                h('span', null, annotatePct(row.recall)),
+                h('span', null, String(row.model)),
+                h('span', null, String(row.extra)),
+                h('span', null, annotatePct(row.extraRate)),
+              )),
+            ),
+          otherTags.length === 0
+            ? null
+            : h(
+              'div',
+              { className: 'hint' },
+              `模型还给过清单外的标签：${otherTags.map((row) => `${row.tag}×${row.model}`).join('、')}`
+                + '（对不上你这 16 个，只算多余、不算遗漏）。',
+            ),
+          h('div', { className: 'card-title' }, '本批逐张对比'),
+          annotate.items.length === 0
+            ? h('div', { className: 'hint' }, '这一批没有可比的条目。')
+            : h(
+              'div',
+              { className: 'annotate-table annotate-table-compare' },
+              ...annotate.items.map((item) => {
+                const draft = annotateDraftOf(item);
+                const manualTags = Array.isArray(draft.tags) ? draft.tags : [];
+                const verdict = logic.textOf(draft.verdict);
+                return h(
+                  'div',
+                  { key: `cmp-${item.md5}`, className: 'annotate-row annotate-row-compare' },
+                  h('span', { className: 'annotate-compare-id' }, logic.textOf(item.file).slice(0, 12)),
+                  h('span', null, `模型：${itemModelTags(item).join('、') || '（空）'}`),
+                  h('span', null, `人工：${manualTags.join('、') || '（未标）'}`),
+                  h('span', { className: verdict === '' ? 'hint' : 'hint-ok' }, `判定：${verdict === '' ? '未标' : verdict}`),
+                );
+              }),
+            ),
+        );
+      }
+
+      const dirtyCount = annotate.items.filter((item) => {
+        const draft = annotate.drafts[item.md5];
+        return draft !== undefined && draft.dirty === true;
+      }).length;
+
+      return h(
+        'div',
+        { className: 'panel' },
+        h(
+          'div',
+          { className: 'card' },
+          h('div', { className: 'card-title' }, '表情标注 · 人工量模型判得准不准'),
+          h(
+            'div',
+            { className: 'hint' },
+            '左边是模型入库时给的标签与描述；你按"这张图真想表达什么"重新勾一遍、写一句、再打三档。'
+              + '人工结果写进 qq-stickers.json（写前先备份、原子写），模型的 tags / desc 原样不动，'
+              + '另外存一份 modelTags / modelDesc 当固定基准。这一页只读素材，不会改动或清除任何一张。',
+          ),
+          h(
+            'div',
+            { className: 'actions' },
+            h('span', { className: 'hint' }, '本批张数'),
+            h('input', {
+              className: 'input annotate-size',
+              type: 'number',
+              min: 1,
+              max: 30,
+              value: annotate.sizeText,
+              onChange: (event) => setAnnotate((prev) => ({ ...prev, sizeText: event.target.value })),
+            }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'button button-primary',
+                disabled: annotate.loading === true,
+                onClick: () => {
+                  if (!confirmDiscardAnnotateDrafts()) return;
+                  loadAnnotate({ size: annotate.sizeText, cursor: 0 });
+                },
+              },
+              '抽一批',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'button',
+                disabled: annotate.loading === true,
+                onClick: () => {
+                  if (!confirmDiscardAnnotateDrafts()) return;
+                  loadAnnotate({ size: annotate.size, cursor: annotate.nextCursor });
+                },
+              },
+              annotate.loading === true ? '读取中…' : '换一批',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'button',
+                disabled: annotate.savingAll === true || dirtyCount === 0,
+                onClick: () => { saveAnnotateAll(); },
+              },
+              dirtyCount > 0 ? `保存改动（${dirtyCount}）` : '保存改动',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'button',
+                disabled: annotate.reportLoading === true,
+                onClick: () => { loadAnnotateReport(); },
+              },
+              annotate.reportLoading === true ? '统计中…' : '计算准确率',
+            ),
+            h(
+              'a',
+              {
+                className: 'button',
+                href: annotateExportHref(),
+                download: 'sticker-labels.json',
+                rel: 'noreferrer',
+              },
+              '导出 JSON',
+            ),
+          ),
+          h(
+            'div',
+            { className: 'hint' },
+            `全库 ${annotate.total} 张，已人工标注 ${annotate.annotated} 张；`
+              + `本批候选池 ${annotate.poolSize} 张`
+              + (annotate.freshOnly
+                ? '（全是没标过的）'
+                : '（没标过的已经不够一批，本批混入了标过的）')
+              + '。抽样按"原始标签不重复"排：一屏尽量覆盖不同的主标签。',
+          ),
+          annotate.error !== ''
+            ? h('div', { className: 'banner' }, annotate.error)
+            : null,
+        ),
+        annotate.loading === true && annotate.items.length === 0
+          ? h('div', { className: 'card' }, h('div', { className: 'hint' }, '正在读取这一批…'))
+          : null,
+        annotate.items.length === 0 && annotate.loading !== true
+          ? h(
+            'div',
+            { className: 'card' },
+            h(
+              'div',
+              { className: 'hint' },
+              annotate.loaded
+                ? '这一批抽不到东西（库里没有可用的图）。'
+                : '点「抽一批」开始。',
+            ),
+          )
+          : null,
+        ...(annotate.items.length === 0
+          ? []
+          : [h(
+            'div',
+            { key: 'annotate-grid', className: 'annotate-grid' },
+            ...annotate.items.map(renderAnnotateCard),
+          )]),
+        renderAnnotateReport(),
+      );
+    }
+
+    /**
      * 渲染某个旁路模型页（2026-10-30）：心情 / 识图 / 表情包 / 语音。
      *
      * 只显示**这几份文件里**的字段（`field.file` 命中），作用域固定为 `global` ——
@@ -1895,7 +2537,9 @@ function createApp({ h, logic, React }) {
             ? renderChannelTab()
             : (activeTab === 'prompt'
               ? renderPromptTab()
-              : renderFileTab(TABS.find((tab) => tab.id === activeTab) ?? TABS[0])))),
+              : (activeTab === 'annotate'
+                ? renderAnnotateTab()
+                : renderFileTab(TABS.find((tab) => tab.id === activeTab) ?? TABS[0]))))),
       // 整页唯一的保存入口，固定在视口底边（见 `renderSaveBar` 的注释）。
       renderSaveBar(dirtyEntries),
       // 重连覆盖层放在**最后**：它是 `position: fixed` 的整页层，DOM 顺序决定它盖在

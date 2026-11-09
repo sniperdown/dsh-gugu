@@ -666,6 +666,21 @@ export function buildSnapshot({
        * 打分不够、发言失败，三者在计数上一模一样。这里把原因本身带出来。
        */
       journal: journalTail(engine?.journal, 12),
+      /**
+       * **判官/启发式决策日志的状态**（2026-11-06 加，`gauge-log.mjs`）。
+       *
+       * 为什么必须进快照：这个功能**默认关闭**，而"关着"与"开着但一行都没写"
+       * 在现象上完全一样（都只是 QQ 上安安静静、文件不存在）。这份快照是
+       * "开关到底读到没有、写到哪个文件、写坏了没有"唯一的当场证据：
+       *
+       * - `enabled:false` ⇒ 没开（`file` 仍是"本来会写哪儿"，方便直接去看）；
+       * - `enabled:true + writes:0` ⇒ 开着，只是这段时间没有候选（正常）；
+       * - `failures>0` ⇒ **写盘失败过**（路径不可写 / 盘满），`lastError` 是原因；
+       *   ⚠️ 这种情况下判定与发送**照常**（写日志绝不挡发送），所以只能靠这里发现。
+       *
+       * `bytes` 是 -1 时表示"还没写过、也没 stat 过"（不是错误）。
+       */
+      gaugeLog: gaugeLogStats(gateway?.gaugeLog),
     },
     /**
      * **启动时灌历史的结果**（2026-10-13 加）。
@@ -893,6 +908,35 @@ function imageDescStats(gateway) {
       failed: s.failed ?? 0,
       cache: s.cache ?? 0,
       dirs: Array.isArray(s.dirs) ? s.dirs : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 判定日志（`gauge-log.mjs`）的计数 —— **取不到就 null**。
+ *
+ * 与 `outboundLedgerStats` 同一个规矩：调试设施本身坏了绝不能拖垮快照。
+ * 全部字段都是白名单取出的标量（快照只留顶层标量，`stats()` 里也没有别的东西）。
+ *
+ * @param {object|null|undefined} log `createGaugeLog()` 的返回值
+ * @returns {object|null}
+ */
+function gaugeLogStats(log) {
+  try {
+    if (log === null || log === undefined || typeof log.stats !== 'function') return null;
+    const s = log.stats() ?? {};
+    return {
+      enabled: s.enabled === true,
+      file: typeof s.file === 'string' ? s.file : '',
+      maxBytes: s.maxBytes ?? 0,
+      // `-1` = 还没写过 / 还没 stat 过（不是错误，判读时别当成"文件是负的"）。
+      bytes: Number.isFinite(Number(s.bytes)) ? Number(s.bytes) : -1,
+      writes: s.writes ?? 0,
+      failures: s.failures ?? 0,
+      rotations: s.rotations ?? 0,
+      lastError: typeof s.lastError === 'string' ? s.lastError : '',
     };
   } catch {
     return null;

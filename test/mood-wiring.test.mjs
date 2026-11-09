@@ -30,6 +30,9 @@ import { SessionBinder } from '../src/dsh/binding.mjs';
 import {
   JUDGE_MODE_HEURISTIC,
   JUDGE_MODE_PRECHECK,
+  PRECHECK_MAX_TOKENS,
+  PRECHECK_MAX_TOKENS_WITH_REASONING,
+  PRECHECK_REASONING_EFFORT,
   buildPrecheckPrompt,
   createPrecheck,
 } from '../src/dsh/judge-mode.mjs';
@@ -240,9 +243,15 @@ test('【a】有心情 ⇒ 只多**一行**，位置在会话背景里（并给�
   const expected = golden.replace('【这条消息的发送者】2003\n', `【这条消息的发送者】2003\n${moodLine}\n`);
   assert.equal(prompt, expected, '就多这一行（插在【会话】那一段里），别处一个字不动');
   assert.equal(outcome.promptChars - golden.length, moodLine.length + 1, 'promptChars 的差 = 那一行 + 一个换行');
-  // 那一次调用仍然极省：预算没变（`maxTokens=4`）/ 系统提示没变 / 没有多轮
-  assert.equal(opts.maxTokens, 4);
-  assert.equal(opts.reasoningEffort, 'off');
+  // 那一次调用仍然极省：系统提示没变 / 没有多轮 / 预算跟着思考档走。
+  // ⚠️ 2026-11-06：`reasoningEffort` 从 `'off'` 改成 `'low'`（档位在 `judge-mode.mjs`），
+  //    预算随之从 4 涨到 96 —— 所以这里**引用常量**而不是写死数字：
+  //    档位是活配置，写死只会让"改了档位"变成一条莫名其妙的红（这次就红了一轮）。
+  assert.equal(opts.reasoningEffort, PRECHECK_REASONING_EFFORT);
+  assert.equal(
+    opts.maxTokens,
+    PRECHECK_REASONING_EFFORT === 'off' ? PRECHECK_MAX_TOKENS : PRECHECK_MAX_TOKENS_WITH_REASONING,
+  );
   assert.equal(opts.messages.length, 1);
   assert.match(opts.system, /预检器/);
 });

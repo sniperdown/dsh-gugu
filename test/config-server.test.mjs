@@ -587,7 +587,7 @@ test('pageHtml 注入：优先于磁盘文件，且同样替换 __TOKEN__', asyn
 
 // ---------------------------------------------------------------- 心跳与自动关闭
 
-test('心跳续命：报到把关闭时刻往后推，距上次心跳 15 秒内不关', async (t) => {
+test('心跳续命：报到把关闭时刻往后推，距上次心跳没超时才不关', async (t) => {
   const { server, clock } = harness();
   t.after(() => server.close());
   const status = await server.open();
@@ -598,17 +598,18 @@ test('心跳续命：报到把关闭时刻往后推，距上次心跳 15 秒内�
   const beat = await request(heartbeat, { method: 'POST', headers: { origin: base } });
   assert.equal(beat.status, 200);
 
-  // 距打开已 24 秒，但距上次心跳只有 14 秒。
-  clock.advance(14000);
+  // 用常量推导，别把秒数写死：改 IDLE_TIMEOUT_MS 不该让这条变红。
+  const justUnder = IDLE_TIMEOUT_MS - 1000;
+  clock.advance(justUnder);
   assert.equal(server.status().state, 'running');
-  assert.equal(server.status().lastBeatMs, 14000);
+  assert.equal(server.status().lastBeatMs, justUnder);
 
-  // 距上次心跳 16 秒 ⇒ 自己关。
+  // 越过判据 ⇒ 自己关。
   clock.advance(2000);
   assert.equal(server.status().state, 'closed');
 });
 
-test('15 秒无心跳自动关：边界是「超过 15 秒」，不是「等于」', async (t) => {
+test('无心跳自动关：边界是「超过判据」，不是「等于」', async (t) => {
   const { server, clock } = harness();
   t.after(() => server.close());
   const status = await server.open();
@@ -618,7 +619,7 @@ test('15 秒无心跳自动关：边界是「超过 15 秒」，不是「等于�
   await request(heartbeat, { method: 'POST', headers: { origin: base } });
 
   clock.advance(IDLE_TIMEOUT_MS);
-  assert.equal(server.status().state, 'running', '恰好 15 秒还没超过判据');
+  assert.equal(server.status().state, 'running', '恰好等于判据时还没超过');
 
   clock.advance(1);
   assert.equal(server.status().state, 'closed');
@@ -627,7 +628,7 @@ test('15 秒无心跳自动关：边界是「超过 15 秒」，不是「等于�
   assert.equal(clock.state.cleared.length, 1, '心跳定时器必须被清掉');
 });
 
-test('从未有过心跳（浏览器没打开）：同样在 15 秒后自动关', async (t) => {
+test('从未有过心跳（浏览器没打开）：同样在超时后自动关', async (t) => {
   const { server, clock } = harness();
   t.after(() => server.close());
   const status = await server.open();

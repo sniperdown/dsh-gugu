@@ -54,8 +54,8 @@ const FULL = [
   'cacheMs = 3000',
   '',
   '[vision_gate.cloud]',
-  'provider = "discovery-intern-ai"',
-  'model = "deepseek-v4-flash-vision"',
+  'provider = "p-vision-test"',
+  'model = "vision-test-model"',
   '',
   '[vision_gate.local]',
   'provider = "local-llamacpp"',
@@ -67,8 +67,8 @@ test('★ 完整的一节：阈值 + 缓存 + 两条路的名字都读到了', (
   const gate = pluginModule.loadVisionGate({ tomlPath: tempToml(FULL) }, () => {});
   assert.equal(gate.freeMiB, 7168);
   assert.equal(gate.cacheMs, 3000);
-  assert.equal(gate.cloud.provider, 'discovery-intern-ai');
-  assert.equal(gate.cloud.model, 'deepseek-v4-flash-vision');
+  assert.equal(gate.cloud.provider, 'p-vision-test');
+  assert.equal(gate.cloud.model, 'vision-test-model');
   assert.equal(gate.local.provider, 'local-llamacpp');
   assert.equal(gate.local.model, 'qwen3.5-4b-q4km-vision');
 });
@@ -82,7 +82,37 @@ test('★ 缺字段 ⇒ 按字段补默认（不是整节丢掉）', () => {
   assert.equal(gate.probeTimeoutMs, 5000);
   assert.equal(gate.local.provider, 'local-llamacpp');
   assert.equal(gate.local.model, '', '本地 model 没写就是空（调用方要能看出来）');
-  assert.equal(gate.cloud.provider, 'discovery-intern-ai', '云那半没写就用代码默认的 v4f');
+  assert.equal(gate.cloud.provider, 'your-provider', '云那半没写就用代码里的占位默认（必须自己配）');
+  assert.equal(gate.enableThinking, false, '没写就关着 —— 加这个键之前的行为一个字节不变');
+});
+
+// ───────────────────────────── enableThinking（图片描述那条路，2026-11-06）
+//
+// ⚠️ 它和 `[sticker_gate] enableThinking` 是**两个键**：那个管「认」（表情包审核），
+// 这个管「转发里那张图配一句话」。两个都默认 false，谁也别替谁决定。
+
+test('★ [vision_gate] enableThinking 从 toml 读进来（true / false 都认）', () => {
+  const on = pluginModule.loadVisionGate({
+    tomlPath: tempToml('[vision_gate]\nenableThinking = true\n'),
+  }, () => {});
+  assert.equal(on.enableThinking, true, '显式打开要能读到（否则这个开关等于不存在）');
+
+  const off = pluginModule.loadVisionGate({
+    tomlPath: tempToml('[vision_gate]\nenableThinking = false\n'),
+  }, () => {});
+  assert.equal(off.enableThinking, false);
+});
+
+test('★ [vision_gate] enableThinking 不是布尔值 ⇒ 回退 false 并**打一条 warn**（夹了必须吭声）', () => {
+  const logs = [];
+  const gate = pluginModule.loadVisionGate({
+    tomlPath: tempToml('[vision_gate]\nenableThinking = "true"\n'),
+  }, (level, message, meta) => logs.push({ level, message, meta }));
+  assert.equal(gate.enableThinking, false, '字符串 true 不认（免得方向猜反）');
+  const warned = logs.find((l) => l.level === 'warn' && String(l.message).includes('enableThinking'));
+  assert.ok(warned, '回退了却没留痕 = "配置写了却不生效"那一族坑，必须有一条 warn');
+  assert.equal(warned.meta.wrote, 'true');
+  assert.equal(warned.meta.using, false);
 });
 
 test('★ 没有 [vision_gate] 这一节 ⇒ 返回 null（门控关闭），并留一条 info 说明"恒走云"', () => {
