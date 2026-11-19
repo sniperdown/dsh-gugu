@@ -13,16 +13,22 @@
  *
  * ## 长唤醒 / 短追问（用户 2026-10-23 定稿，逐条确认过）
  *
- * 「最后一条」一律指**用户自己发的入站消息**（`gateway.handleEvent` 记进
- * `lastUserMessageAt`），**不是**她回的那句。锚点因此只有这一个：
+ * **长唤醒**的锚点只有"用户自己发的入站消息"（`gateway.handleEvent` 记进
+ * `lastUserMessageAt`），**不是**她回的那句。
+ *
+ * **短追问**的计时基准（🔴 2026-11-18 用户报的 bug）不能只看用户入站：
+ * 那样"她刚说完话、用户上一句隔得久"⇒ 追问立刻触发，而"她刚说完话"本该是最不需要追问的时刻。
+ * 现在取 **`max(用户最后一条入站, 她自己最后一条出站)`** —— 任何一次出站都把短钟推后。
+ * 出站走 `gateway.#sendOne` 成功之后 → `gateway.onSelfMessage` → 本文件 `noteSelfMessage`。
  *
  * - **长唤醒**（原来的定时器，截图 + 「你自己的时间」）：
  *   条件 `now - max(上次长唤醒, 用户最后一条消息) ≥ intervalHours`。
  *   ⇒ **用户一说话，长钟就顺延**（例：10:00 长唤醒，10:30 用户说话 ⇒ 下次 12:30）。
  *   四道闸全过（含 `busy`）。
- * - **短追问**（`followupMinutes`，默认 10）：用户最后一条消息之后这么久还没动静
- *   ⇒ 叫她一声，问"你是不突然不回了"。
- *   **只过前三道**（enabled / 时间窗 / 距用户最后一条消息），**不查 `busy`**
+ * - **短追问**（`followupMinutes`，默认 10）：`max(用户最后一条入站, 她最后一条出站)`
+ *   之后这么久还没动静 ⇒ 叫她一声，问"你是不突然不回了"。
+ *   她**在群里**说话不算（与"只有私聊能重新上膛"同一口径：这个钟追的是私聊）。
+ *   **只过前三道**（enabled / 时间窗 / 距最后一条消息（用户或她自己）），**不查 `busy`**
  *   （她真在忙着回话，那就不叫"沉默"，这条钟本来也不会到点）。**不截图**。
  * - **短追问只响一次**：响了就置 `followupDone = true` 锁住，不会 10 分钟一次没完。
  *   **用户再发一条消息 ⇒ 重新武装**（`followupDone = false`，重新计 10 分钟）。
@@ -68,8 +74,10 @@
  * - **不重试**：这一次没叫醒就算了，下一个 interval 再说；没有补叫机制（简单、可预测）。
  *   短追问也一样：**失败也算"响过了"**（`followupDone` 仍然置真）—— 一失败就每分钟重试，
  *   和"只追问一次"的语义直接打架。
- * - **只有两个字段持久化**：`lastUserMessageAt` / `followupDone`（2026-10-23）。
- *   它们是**跨重启的语义**（重启之后"用户最后一句是什么时候"不能忘，否则短追问会
+ * - **只有三个字段持久化**：`lastUserMessageAt` / `lastSelfMessageAt` / `followupDone`。
+ *   （`followupDone` 与 `lastUserMessageAt` 2026-10-23；`lastSelfMessageAt` 2026-11-18
+ *   加 —— 少了它，热重载之后"她刚说完话"这条事实就丢，追问会立刻按用户的旧消息炸一轮。）
+ *   它们是**跨重启的语义**（重启之后"用户最后一句 / 她最后一句是什么时候"不能忘，否则短追问会
  *   从零开始或立刻炸一轮）；计数类（`runs` / `sent` / `skipReasons` …）仍旧重启归零，
  *   那只是"当场一眼看"。
  *   落盘位置与写法**跟着现成的那套走**：`<DSH_HOME>\media\qq-proactive-free-time.json`，
@@ -274,7 +282,8 @@ function normalizeShotFormat(value) {
  *   ⚠️ **测试必须显式注入**（`() => null`）：默认实现会读本机真实日志，
  *   那会让"提示词逐字节相等"这类断言随当天日志飘。
  * @param {string} [options.statePath] 跨重启状态的落盘路径（空 = 不落盘，测试默认）。
- *   只存 `lastUserMessageAt` / `followupDone` 两项 —— 见模块注释"只有两个字段持久化"。
+ *   只存 `lastUserMessageAt` / `lastSelfMessageAt` / `followupDone` 三项 ——
+ *   见模块注释"只有三个字段持久化"。
  */
 export function createFreeTime({
   gateway,
@@ -317,21 +326,30 @@ export function createFreeTime({
   /**
    * 状态。
    *
-   * 只有 `lastUserMessageAt` / `followupDone` **跨重启**（见下面 `loadPersisted`）；
-   * 其余都是计数，重启归零（和 `lastRunAt` 的老口径一致）。
+   * 只有 `lastUserMessageAt` / `lastSelfMessageAt` / `followupDone` **跨重启**
+   * （见下面 `loadPersisted`）；其余都是计数，重启归零（和 `lastRunAt` 的老口径一致）。
    *
    * ⚠️ `lastRunAt` 是**长唤醒**的锚点，短追问**不动它** ——
    * 否则一次追问就会把 2 小时的长钟推后，两个闹钟会互相吃掉。
    */
   const state = {
     lastRunAt: null,
-    /** 用户最后一条入站消息（长/短两个钟共同的锚点）。 */
+    /** 用户最后一条入站消息（长唤醒锚点 + 短追问基准之一）。 */
     lastUserMessageAt: null,
+    /**
+     * 她自己最后一条**出站**（真的发到 QQ 上的一句 / 一条，2026-11-18）。
+     *
+     * 存在的理由（用户报的 bug）：「追问轮看的是**我给你发消息之后**过的时间，
+     * 不是**我发完消息之后**过的时间」。所以她一发话，短钟就得从她说的那句重新起算。
+     */
+    lastSelfMessageAt: null,
     /** 这轮沉默是否已经追问过。`true` = 不用追问（初值就是"没有待追问的沉默"）。 */
     followupDone: true,
     lastFollowupAt: null,
     lastWakeKind: null,
     userMessages: 0,
+    /** 记下来的**她自己的出站**条数（诊断用；口径见 `noteSelfMessage`）。 */
+    selfMessages: 0,
     runs: 0,
     longWakes: 0,
     followups: 0,
@@ -380,6 +398,10 @@ export function createFreeTime({
       const rawAt = raw?.lastUserMessageAt;
       const at = typeof rawAt === 'number' ? rawAt : Date.parse(String(rawAt ?? ''));
       if (Number.isFinite(at) && at > 0) state.lastUserMessageAt = at;
+      // 2026-11-18：老文件没有这个键 ⇒ 保持 `null`（退回"只看用户入站"，与改动前一致）。
+      const rawSelf = raw?.lastSelfMessageAt;
+      const selfAt = typeof rawSelf === 'number' ? rawSelf : Date.parse(String(rawSelf ?? ''));
+      if (Number.isFinite(selfAt) && selfAt > 0) state.lastSelfMessageAt = selfAt;
       state.followupDone = raw?.followupDone !== false;
     } catch {
       /* 没写过 / 坏了 / 读不了 ⇒ 全新开始 */
@@ -397,6 +419,7 @@ export function createFreeTime({
       fs.mkdirSync(path.dirname(statePath), { recursive: true });
       const payload = {
         lastUserMessageAt: state.lastUserMessageAt === null ? null : new Date(state.lastUserMessageAt).toISOString(),
+        lastSelfMessageAt: state.lastSelfMessageAt === null ? null : new Date(state.lastSelfMessageAt).toISOString(),
         followupDone: state.followupDone,
         savedAt: new Date(now()).toISOString(),
       };
@@ -423,6 +446,20 @@ export function createFreeTime({
 
   // 构造时就把跨重启状态接回来（读不到 = 全新开始）。
   loadPersisted();
+
+  /**
+   * **短追问的计时基准**：`max(用户最后一条入站, 她自己最后一条出站)`（2026-11-18）。
+   *
+   * 用户原话：「插件的追问轮看的是**我给你发消息之后**过的时间，不是**我发完消息之后**
+   * 过的时间。」⇒ 任何一次出站都要把短钟推后。
+   *
+   * 两边都没有 ⇒ `null`（调用方在 `lastUserMessageAt === null` 时早就返回了，轮不到这里）。
+   * @returns {number|null}
+   */
+  function shortFollowupAnchor() {
+    const values = [state.lastUserMessageAt, state.lastSelfMessageAt].filter((value) => value !== null);
+    return values.length === 0 ? null : Math.max(...values);
+  }
 
   /**
    * **用户自己发了一条消息**（`gateway.handleEvent` 的汇合点调进来）。
@@ -491,6 +528,41 @@ export function createFreeTime({
   }
 
   /**
+   * **她自己发出去了一条**（`gateway.#sendOne` 真的发成功之后调进来，2026-11-18）。
+   *
+   * 只做一件事：把短追问的计时基准往前推。**不改 `followupDone`** ——
+   * 「这轮沉默追没追过」是另一件事，由 `noteUserMessage`（重新上膛）与短钟自己（响过就锁）管。
+   *
+   * 三条口径（与 `noteUserMessage` 对称，别在这里另立一套）：
+   * - **只认私聊**（`privateChatId`）：短追问追的是私聊；她在群里说的话不给私聊的短钟续命。
+   *   没有 `chatId`（认不出）⇒ fail-closed，**不记**。
+   * - **更早的时间戳直接忽略**（乱序 / 补发）—— 别把基准往回拨。
+   * - **永不抛**：它挂在发送成功之后，抛出去会冒到发送链上。
+   *
+   * @param {{at?: number, chatId?: string}} message
+   * @returns {boolean} 真的记下来没有
+   */
+  function noteSelfMessage(message) {
+    try {
+      const chatId = String(message?.chatId ?? '').trim();
+      if (chatId === '' || chatId !== privateChatId) return false;
+      const raw = Number(message?.at);
+      const at = Number.isFinite(raw) && raw > 0 ? raw : now();
+      if (state.lastSelfMessageAt !== null && at < state.lastSelfMessageAt) return false;
+      state.lastSelfMessageAt = at;
+      state.selfMessages += 1;
+      persist();
+      return true;
+    } catch (error) {
+      // 挂在发送成功之后 ⇒ 绝不往外抛（最多是短钟基准旧一点）。
+      log('debug', '她自己的时间：记自己的出站失败（忽略）', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
    * 走一次闸。返回"该不该叫她"、是哪个闹钟（`kind`）、和为什么。
    * 拆出来是为了**可测**，也让 skipped 的原因能被快照看见（坏了要看得出来）。
    *
@@ -519,14 +591,17 @@ export function createFreeTime({
       return { wake: true, reason: 'go', kind: 'long', cfg };
     }
 
-    // ── ② 短追问：只过前三道闸（enabled / 时间窗 / 距用户最后一条消息）──
+    // ── ② 短追问：只过前三道闸（enabled / 时间窗 / 距最后一条消息）──
     // **不查 busy**：她真在忙着回话，那就不叫"沉默"，这条钟本来也到不了点。
     //
     // 还没人说过话 ⇒ 报 `too-soon`（长钟还没到点，也没有"沉默"可追问）——
     // 这是**改动前的老原因**，让"没到点"在快照里沿用同一个词。
     if (state.lastUserMessageAt === null) return { wake: false, reason: 'too-soon', kind: 'long' };
     if (state.followupDone) return { wake: false, reason: 'short-done', kind: 'short' };
-    if (at - state.lastUserMessageAt < followupMsOf(cfg)) {
+    // 🔴 2026-11-18：基准 = `max(用户最后一条入站, 她自己最后一条出站)`。
+    // 只看用户入站时的 bug：她刚说完话、用户上一句隔得久 ⇒ 追问立刻触发（最不该问的时刻）。
+    const shortAnchor = shortFollowupAnchor();
+    if (shortAnchor === null || at - shortAnchor < followupMsOf(cfg)) {
       return { wake: false, reason: 'short-too-soon', kind: 'short' };
     }
     return { wake: true, reason: 'go', kind: 'short', cfg };
@@ -779,17 +854,24 @@ export function createFreeTime({
     return {
       sessionKey: sessionKeyOf(),
       lastRunAt: state.lastRunAt === null ? null : new Date(state.lastRunAt).toISOString(),
-      /** 用户最后一条入站消息（长/短两个钟共同的锚点）；`null` = 重启后还没人说过话。 */
+      /** 用户最后一条入站消息（长唤醒的锚点、短追问基准之一）；`null` = 重启后还没人说过话。 */
       lastUserMessageAt: state.lastUserMessageAt === null ? null : new Date(state.lastUserMessageAt).toISOString(),
+      /**
+       * 她自己最后一条出站（短追问基准之二，2026-11-18）。
+       * `null` = 还没记过（老状态文件 / 刚重启）⇒ 短钟退回"只看用户入站"。
+       */
+      lastSelfMessageAt: state.lastSelfMessageAt === null ? null : new Date(state.lastSelfMessageAt).toISOString(),
       /** 这轮沉默是否已经追问过。`true` = 短钟已响过（或者还没人说话）。 */
       followupDone: state.followupDone,
-      /** 下一次短追问的时刻；`null` = 没有待追问的沉默。 */
-      nextFollowupAt: state.lastUserMessageAt === null || state.followupDone
+      /** 下一次短追问的时刻（基准 = max(用户最后一条, 她最后一条)）；`null` = 没有待追问的沉默。 */
+      nextFollowupAt: state.lastUserMessageAt === null || state.followupDone || shortFollowupAnchor() === null
         ? null
-        : new Date(state.lastUserMessageAt + followupMs).toISOString(),
+        : new Date(shortFollowupAnchor() + followupMs).toISOString(),
       lastFollowupAt: state.lastFollowupAt === null ? null : new Date(state.lastFollowupAt).toISOString(),
       lastWakeKind: state.lastWakeKind,
       userMessages: state.userMessages,
+      /** 记下来的**她自己的出站**条数（非私聊 / 更早的时间戳都不算）。 */
+      selfMessages: state.selfMessages,
       /** 最后一条用户消息来自哪个会话（`private:…` / `group:…`）；空 = 还没记过。 */
       lastUserMessageChat: state.lastUserMessageChat,
       /** 私聊重新上膛 / 群聊只推锚点 的次数（2026-10-26 拆分后才有意义）。 */
@@ -815,5 +897,5 @@ export function createFreeTime({
     };
   }
 
-  return { tick, shouldWake, stats, noteUserMessage };
+  return { tick, shouldWake, stats, noteUserMessage, noteSelfMessage };
 }

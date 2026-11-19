@@ -78,6 +78,19 @@
  * 然后照常收消息、照常回消息（只是这一轮偷不到东西）。
  * **它绝不能变成单点故障** —— 这是用户的硬要求，也是那张描述表的原则（照抄）。
  *
+ * ## ④ 挑 / 淘汰的三个旋钮（2026-11-18）
+ *
+ * 方案：[`shared/2026-11-18-表情包打分方案.md`](../../../shared/2026-11-18-表情包打分方案.md)。
+ *
+ * | 旋钮 | 在哪生效 | 关掉之后 |
+ * |---|---|---|
+ * | `halfLifeDays` / `recentFloor`（半衰期衰减） | `pick` 的权重乘法 | `halfLifeDays = 0` ⇒ factor 恒 1.0 = 今天的行为 |
+ * | `protectLastOfTag`（别删掉某标签的最后一张） | `evict` 的候选筛选 | `false` ⇒ 走原排序 = 今天的行为 |
+ * | 候选表（群友频次，**只记不判**） | `keepOne` 里一次计数 | `candidates: null` ⇒ 一张都不记 |
+ *
+ * 前两个的参数与夹紧在 `sticker-pick.mjs`，第三个在 `sticker-candidates.mjs`。
+ * **三者各自的开关都独立**，任何一步关掉都必须逐字节等价于改动前。
+ *
  * @module qq-gugu/sticker-library
  */
 
@@ -87,6 +100,17 @@ import path from 'node:path';
 import { MAX_IMAGE_BYTES, fetchImageBytes, sniffImageMediaType } from './media.mjs';
 import { dshHome } from './paths.mjs';
 import { createOriginalFinder, md5Hex } from './image-cache.mjs';
+import {
+  DEFAULT_STICKER_PICK,
+  halfLifeFactor,
+  loadStickerPickConfig,
+  normalizeStickerPick,
+} from './sticker-pick.mjs';
+import {
+  DEFAULT_CANDIDATES_FILE,
+  createStickerCandidates,
+} from './sticker-candidates.mjs';
+
 // ⚠️ 这里**不再** import `image-desc.mjs` 的 `isAnimationClaimLabel` / `isUnknownImageLabel`：
 //    位判据下 `summary` 一个字节都不参与判定（它是 NapCat 按 `sub_type` 合成的），
 //    留着那两个函数只会让人以为"summary 还在参与判断"。
@@ -317,11 +341,26 @@ export function createStickerIndex({
   fsImpl = nodeFs,
   maxEntries = DEFAULT_MAX_STICKERS,
   now = () => Date.now(),
+  protectLastOfTag = DEFAULT_STICKER_PICK.protectLastOfTag,
 } = {}) {
   const target = String(filePath ?? '').trim();
   /** @type {Map<string, object>} */
   const entries = new Map();
-  const stats = { writes: 0, dropped: 0, seenBumps: 0, reads: 0 };
+  const stats = {
+    writes: 0,
+    dropped: 0,
+    seenBumps: 0,
+    reads: 0,
+    // ── 2026-11-18 淘汰保护（`protectLastOfTag`）的三个计数 ──
+    // `protectedEvictions` = 保护层真的改变了结果（在"不是最后一张"的池子里挑的）；
+    // `protectFallback`    = 保护层筛成空集、被迫降级回原始排序的次数
+    //                        （一直涨 ⇒ 库太小、18 个标签全变单例，方案 §5 风险 4）；
+    // `protectStuck`       = 连原始排序都挑不出受害者（不该发生；非 0 就要看日志）。
+    protectedEvictions: 0,
+    protectFallback: 0,
+    protectStuck: 0,
+    lastEvictProtected: false,
+  };
   let degraded = false;
   const usable = target !== '';
 
@@ -388,15 +427,72 @@ export function createStickerIndex({
    * 依据来自 MaiBot 的淘汰抽样（`emoji_manager.py:815-889`）：
    * `probabilities = [1 / (usage_count + 1) …]` —— 用得越少越可能被淘汰。
    * 我们不做随机抽样（那要小模型来裁），只做确定性的同向淘汰，够用且可测。
+   *
+   * ## 2026-11-18：先过一道「最后一张保护」（`protectLastOfTag`）
+   *
+   * 原排序**不看这张图是不是某个标签的唯一持有者**。删掉那张以后，那个标签在库里就没有了
+   * ⇒ `pick({tags:['生气不满']})` 直接返回 `null`（见 `pick` 的空候选分支）
+   * ⇒ 她**再也表达不出这个情绪**，而日志里一个字都没有。
+   *
+   * 保护口径（方案 §2.1）：
+   *
+   * ```
+   * tagCount[t]      = 全库有多少张带标签 t
+   * protected(entry) = entry.tags.some(t => tagCount[t] === 1)   ← ★ 任一命中即保护
+   * 候选人 = entries - protected；候选人非空就在候选人里按原排序挑
+   * ```
+   *
+   * ⚠️ **必须是 `some` 不是 `every`**：一张图同时挂着 `生气不满`(全库仅 1 张) 和
+   * `调侃吐槽`(30 张) 时，`every` 会判它"不受保护"然后删掉，`生气不满` 当场灭绝。
+   * 空标签条目（`tags: []`）**不参与保护** —— 没有标签就没有"最后一张"的概念，
+   * 它们是天然的优先受害者（认都没认出来的图最不该占位）。
+   *
+   * ## ⚠️⚠️ 候选人筛成空集时**必须降级**，不能 `break`
+   *
+   * 库缩到几十张时完全可能"每张都是某个标签的最后一张"。这时若候选人空就 `break`，
+   * 库会**静默停在上限之上、一张都删不掉**（这条路径本来就不打日志）。
+   * 所以降级是**强制的**：回退到原始排序，保证一定删得掉，并计 `protectFallback`
+   * + 打一条 warn（"保护层每次都在降级"是要看得见的信号，方案 §5 风险 4）。
    */
   function evict() {
     const limit = Number.isFinite(maxEntries) && maxEntries > 0
       ? Math.floor(maxEntries)
       : DEFAULT_MAX_STICKERS;
     while (entries.size > limit) {
+      /** 这一轮真正参与挑选的池子（默认全库；保护层生效时是"不是任何标签最后一张"的那些）。 */
+      let pool = entries;
+      let protectedCount = 0;
+      let degradeReason = '';
+      if (protectLastOfTag) {
+        const tagCount = new Map();
+        for (const [, entry] of entries) {
+          for (const tag of entry.tags) tagCount.set(tag, (tagCount.get(tag) ?? 0) + 1);
+        }
+        // ⚠️ 每次 while 都要重算：删掉一张会让别的标签的计数变化。
+        const survivors = new Map();
+        for (const [md5, entry] of entries) {
+          const isLastOfSomeTag = entry.tags.some((tag) => (tagCount.get(tag) ?? 0) === 1);
+          if (isLastOfSomeTag) protectedCount += 1;
+          else survivors.set(md5, entry);
+        }
+        if (survivors.size > 0) {
+          pool = survivors;
+        } else {
+          // 降级：保护层这次筛空了（库太小，18 个标签全变单例）。**回退原始顺序。**
+          stats.protectFallback += 1;
+          degradeReason = 'every-entry-is-last-of-some-tag';
+          log('warn', '淘汰保护层筛成空集（每张都是某个标签的最后一张）⇒ 回退到"用得少的先走"，照常删', {
+            size: entries.size,
+            limit,
+            protected: protectedCount,
+            reason: degradeReason,
+          });
+        }
+      }
+
       let victim = null;
       let victimRank = null;
-      for (const [md5, entry] of entries) {
+      for (const [md5, entry] of pool) {
         const rank = [entry.uses, entry.at, md5];
         if (victimRank === null
           || rank[0] < victimRank[0]
@@ -405,9 +501,26 @@ export function createStickerIndex({
           victimRank = rank;
         }
       }
-      if (victim === null) break;
+      // ⚠️ 这个 `break` 只应该出现在 `pool` 为空这种不可能分支上（`entries.size > limit ≥ 0`
+      //    ⇒ 池子非空；保护层筛空已经在上面降级过了）。留着当兜底，但**不许**让它成为
+      //    "候选被筛空"的那条路 —— 那正是方案 §2.2 点名的陷阱。
+      if (victim === null) {
+        stats.protectStuck += 1;
+        log('warn', '淘汰找不到可删的条目（不该发生；库可能停在上限之上）', {
+          size: entries.size,
+          limit,
+          protectLastOfTag,
+        });
+        break;
+      }
       entries.delete(victim);
       stats.dropped += 1;
+      if (protectLastOfTag && pool !== entries && degradeReason === '') {
+        stats.protectedEvictions += 1;
+        stats.lastEvictProtected = true;
+      } else {
+        stats.lastEvictProtected = false;
+      }
     }
   }
 
@@ -588,7 +701,26 @@ export function createStickerIndex({
     },
     size: () => entries.size,
     persist,
-    stats: () => ({ ...stats, size: entries.size, degraded, enabled: usable }),
+    stats: () => {
+      // `tagCoverage`：全库有多少标签、其中有多少**只剩 1 张**（2026-11-18，方案 §2.4-B）。
+      // 为什么要这个数：保护层一直在降级时（库太小、18 个标签全变单例）**它不会报错**，
+      // 只是"每张都被保护 ⇒ 每次都走降级"⇒ 保护层等于白算。`singleton` 一路涨到
+      // `total` 就是那个信号（方案 §5 风险 4）—— 要看得见，而不是静默。
+      const tagCount = new Map();
+      for (const entry of entries.values()) {
+        for (const tag of entry.tags) tagCount.set(tag, (tagCount.get(tag) ?? 0) + 1);
+      }
+      let singleton = 0;
+      for (const n of tagCount.values()) if (n === 1) singleton += 1;
+      return {
+        ...stats,
+        size: entries.size,
+        degraded,
+        enabled: usable,
+        protectLastOfTag,
+        tagCoverage: { total: tagCount.size, singleton },
+      };
+    },
   };
 }
 
@@ -621,6 +753,21 @@ export function createStickerIndex({
  * @param {string[]} [options.originalDirs] 本地原件目录模板
  * @param {() => number} [options.now]
  * @param {number} [options.maxEntries]
+ * @param {{halfLifeDays?: number, recentFloor?: number, protectLastOfTag?: boolean}|null} [options.stickerPick]
+ *   挑图/淘汰的参数（**半衰期衰减 + 最后一张保护**，方案 2026-11-18 的 §1/§2）。
+ *   - 传对象 ⇒ 用它（夹紧一次，越界打 warn）；
+ *   - 不传 / `null` ⇒ 自己去读 `qq-gugu.sticker.toml` 的 `[sticker_pick]`
+ *     （`loadStickerPickConfig`；读不到就用 {@link DEFAULT_STICKER_PICK}）。
+ *   ⚠️ 第二档是**临时通道**：真源本该由 `index.mjs` 的 `sideTomlPath(config,'sticker')`
+ *   读好传进来（同 `loadStickerGate` 的形状）。2026-11-18 这次改动的文件边界不允许动
+ *   `index.mjs`，所以加载器自己在同一口径（`resolveModelToml`）上解析一次；
+ *   一旦 `index.mjs` 传了这个参数，它就不再读盘。
+ * @param {object|null|undefined} [options.candidates]
+ *   候选表（方案 §3 的「只记不判」：群友频次，**不参与打分**）。
+ *   - `null` ⇒ 明确关掉（一张都不记）；
+ *   - 传对象 ⇒ 用它（测试注入）；
+ *   - 不传 ⇒ 按 `indexPath` 所在目录自动建一张（`qq-sticker-candidates.json`），
+ *     行为与"没有它"**逐字节等价** —— 它只写盘，不产生任何返回值分支。
  * @param {((image: {data: Uint8Array, mediaType: string, name?: string}, meta: {chatId: string, userId: string, subType: unknown}) => Promise<{ok?: boolean, accept?: boolean, reject?: string|null, rejects?: string[], scores?: object, isSticker?: boolean, portrait?: boolean, screenshot?: boolean, captionChars?: number, tags?: string[], desc?: string}|null>)|null} [options.recognize]
  *   「认」那一步（`image-desc.mjs` 的 `describeSticker`）。**不传 = 这一档整个不跑**
  *   （没有视觉服务的部署照样能攒图，只是 tags 全空、也没有审核闸）。
@@ -644,19 +791,71 @@ export function createStickerLibrary({
   now = () => Date.now(),
   maxEntries = DEFAULT_MAX_STICKERS,
   recognize = null,
+  stickerPick = null,
+  candidates = undefined,
 } = {}) {
   const stickerDir = String(dir ?? '').trim();
   const indexPathSafe = String(indexPath ?? '').trim();
   const auditPathSafe = String(auditPath ?? '').trim();
   // 没给目录 = 明确关掉（不猜一个默认目录往用户磁盘上写）。
   const usable = enabled === true && stickerDir !== '';
+
+  // ── 挑图/淘汰的参数（半衰期 + 老标签保护，2026-11-18）──
+  //
+  // ⚠️ 这里必须**留痕**：`clamped` 里每一条都是"用户写了但没按他写的跑"，
+  //    静默夹紧正是这个项目最贵的一类坑（见 `sticker-pick.mjs` 的模块注释）。
+  const pickSource = stickerPick !== null && typeof stickerPick === 'object'
+    ? { ...normalizeStickerPick(stickerPick), tomlPath: '', found: true }
+    : loadStickerPickConfig({ log });
+  for (const item of pickSource.clamped ?? []) {
+    if (stickerPick !== null) {
+      // 走"调用方传对象"这条路时加载器没参与，warn 得在这里补上。
+      log('warn', `[sticker_pick] ${item.key} 的值不合法，已回退/夹到边界（生效的是"夹过之后"的值）`, {
+        wrote: item.wrote,
+        using: item.using,
+      });
+    }
+  }
+  const pickConfig = {
+    halfLifeDays: pickSource.halfLifeDays,
+    recentFloor: pickSource.recentFloor,
+    protectLastOfTag: pickSource.protectLastOfTag,
+  };
+  // ③ 的开关（`[sticker_admit]`）：`enabled=false` ⇒ 连候选表都不建。
+  // `mode` 现在只可能是 `observe`（`enforce` 是 ③b，还没实现 —— 写了会 warn + 降级）。
+  const admitSwitch = {
+    enabled: pickSource.admit?.enabled !== false,
+    mode: 'observe',
+  };
+
   const table = index ?? createStickerIndex({
     filePath: indexPathSafe,
     log,
     fsImpl,
     maxEntries,
     now,
+    protectLastOfTag: pickConfig.protectLastOfTag,
   });
+
+  // ── 候选表（"群友频次"，方案 §3 的 ③a：**只记不判**）──
+  //
+  // `null` = 明确关掉；不传 = 按索引目录自动建一张（同目录、同结构，见
+  // `sticker-candidates.mjs`）。⚠️ 它**不参与打分**，也不改变 `keepOne` 的任何返回值 ——
+  // 这一步只为"两周后拿真实分布定阈值"收集数据（方案 §3.5）。
+  let candidateTable = null;
+  if (candidates === undefined) {
+    const indexDir = indexPathSafe === '' ? '' : path.dirname(indexPathSafe);
+    if (usable && indexDir !== '' && admitSwitch.enabled) {
+      candidateTable = createStickerCandidates({
+        filePath: path.join(indexDir, DEFAULT_CANDIDATES_FILE),
+        log,
+        fsImpl,
+        now,
+      });
+    }
+  } else if (candidates !== null && typeof candidates === 'object') {
+    candidateTable = candidates;
+  }
 
   const stats = {
     harvested: 0, stored: 0, dedup: 0, nearMiss: 0,
@@ -671,6 +870,21 @@ export function createStickerLibrary({
     rejected: 0, auditFailed: 0,
     failed: 0, unrecognized: 0, tooLarge: 0, skipped: 0, idMatched: 0, idMismatch: 0,
   };
+  /**
+   * 「挑」这一层的计数（2026-11-18：半衰期衰减接上之后新增）。
+   *
+   * 为什么必须有：`lastUsedAt` 在此之前是**零读者**（`recordUse` 写完没人看）。
+   * 一个刚接上的乘数如果没有任何计数，"它到底压了没有、压了多少"只能靠翻日志 ——
+   * 所以这里数三个数（可通过 `stats().pick` 看见）：
+   *
+   * - `nullLastUsedAt`：候选里"从没发过"的条数（`factor` 恒 1.0 的那一档）。
+   *   ⚠️ 方案 §5 风险 2 的判据就是**这个数不能因为改动而下降** ——
+   *   下降意味着有人把兜底改成了 `entry.at`（老图被系统性压下去）。
+   * - `decayed`：这一轮真的被压过（factor < 1）的条数。
+   * - `weightZero`：权重总和不是正数、退化成均匀随机的次数（方案 §5 风险 11；
+   *   `halfLifeFactor` 对非法日期返回 1.0，就是为了让这个数**恒为 0**）。
+   */
+  const pickStats = { picks: 0, nullLastUsedAt: 0, decayed: 0, weightZero: 0 };
   let pending = 0;
   /** 串行链：偷是后台活，没必要并发下载（也让测试里可确定地 await）。 */
   let chain = Promise.resolve();
@@ -785,6 +999,32 @@ export function createStickerLibrary({
         table.set(md5, { ...already, emojiId: evidence.emojiId });
       }
       return 'dedup';
+    }
+
+    // ③a **候选表：只记不判**（2026-11-18，方案 §3.1/§3.5）。
+    //
+    // 插点就在"内容去重 return 之后、(「认」)之前"，三个理由：
+    // 1. 字节已经在手上（md5 刚算完）⇒ 算这一次**零额外成本**；
+    // 2. 已入库的图在上面就 `return 'dedup'` 了 ⇒ 不会重复计数；
+    // 3. 在「认」**之前** ⇒ 没过审核的图**也会被计数**，这正是用户要的"入库前"。
+    //
+    // ⚠️ 这一段**不改任何返回值**（③a 是观察期）：写失败只打一条 warn。
+    // ⚠️ 自己发的消息：协议层已经丢了（`onebot/protocol.mjs` 的 `ignoreSelf`），
+    //    这里再拦一道是防退化 —— 哪天有人关掉 `ignoreSelf`，`skippedSelf` 会直接涨。
+    if (candidateTable !== null) {
+      try {
+        candidateTable.observe({
+          md5,
+          userId,
+          emojiId: evidence.emojiId,
+          self: botQQ !== '' && String(userId ?? '') === String(botQQ),
+        });
+      } catch (error) {
+        log('warn', '候选表计数失败（不影响入库）', {
+          md5,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     // ③b 「认」：一次调用出 safe / text / desc / tags（见本函数的 JSDoc）。
@@ -1027,6 +1267,10 @@ export function createStickerLibrary({
      * - 给了 `mood` 时，对**有描述**的候选再乘一个「字面贴合」系数（中文二元组重合率，
      *   `1 + 3 × 重合率`，上限 ×4）。**刻意不调模型**：那会变成每发一张图一次请求，
      *   而且她本来就知道自己想表达什么，用一个词的骰子更划算；
+     * - ⭐ 2026-11-18：再乘一个**时间衰减** `1 - (1-floor)·2^(-Δ/H)`（`sticker-pick.mjs`）。
+     *   Δ = 距上次发出多少天，`lastUsedAt` 为空 ⇒ **1.0**（从没发过 = 不压，
+     *   **不拿 `entry.at` 兜底** —— 那是入库时间，方向正好反）。这是"别把同一张连发霸屏"
+     *   和"别让发过的永远压死"之间的那个旋钮；
      * - 最后按权重做**加权随机**（同样贴合的两张，仍然随机 —— 不然每次都是同一张）。
      *
      * @param {{tags?: string[], mood?: string}} [options]
@@ -1095,11 +1339,32 @@ export function createStickerLibrary({
             weight *= 1 + 3 * (hit / keyGrams.size);
           }
         }
+        // ③ **时间衰减**（2026-11-18，方案 §1.4）：乘在 `tagWeight × descBonus` **之后**，
+        //    而且**无条件**执行 —— `wanted` 为空（全库随机）时也要压，
+        //    否则"全库随机"那条路会变成"专挑刚发过的那几张"。
+        //
+        //    ⚠️ 时间戳来源只有 `entry.lastUsedAt`（`recordUse` 写的 ISO 串）。
+        //    **绝对不要**退化成 `entry.at`：那是**入库时间**，拿它兜底等于系统性惩罚
+        //    "入库很久但一次都没发过"的图（老图永远选不上），方向正好反。
+        //    `lastUsedAt` 为空 ⇒ factor 1.0（= 不压），由 `halfLifeFactor` 保证。
+        const factor = halfLifeFactor(entry.lastUsedAt, now(), pickConfig);
+        if (factor < 1) pickStats.decayed += 1;
+        weight *= factor;
         return { entry, weight };
       });
+      pickStats.picks += 1;
+      pickStats.nullLastUsedAt += scored.reduce(
+        (n, item) => n + (String(item.entry.lastUsedAt ?? '').trim() === '' ? 1 : 0),
+        0,
+      );
 
       const total = scored.reduce((sum, item) => sum + item.weight, 0);
-      if (!(total > 0)) return scored[Math.floor(Math.random() * scored.length)].entry;
+      if (!(total > 0)) {
+        // 三道乘法（标签 × 描述 × 半衰期）任一算出 NaN 都会走到这里，静默退化成
+        // 均匀随机 —— 看起来"还能发图"，只是挑得变差。所以这个数必须被数出来。
+        pickStats.weightZero += 1;
+        return scored[Math.floor(Math.random() * scored.length)].entry;
+      }
       let r = Math.random() * total;
       for (const item of scored) {
         r -= item.weight;
@@ -1154,7 +1419,31 @@ export function createStickerLibrary({
     },
     /** 库目录（诊断用）。 */
     dir: () => stickerDir,
-    /** 计数 + 索引自身状态（`degraded` / `enabled` / `size`）。 */
-    stats: () => ({ ...stats, pending, dir: stickerDir, index: table.stats() }),
+    /**
+     * 计数 + 索引自身状态（`degraded` / `enabled` / `size`）。
+     *
+     * 2026-11-18 起多两块（都是"新参数到底生效没有"的直接证据）：
+     * - `pick`：生效的半衰期参数（`halfLifeDays` / `recentFloor` / `protectLastOfTag`，
+     *   以及读的是哪个 toml、有没有读到那一节）+ 三个挑图计数（见 `pickStats`）；
+     * - `candidates`：候选表的状态（`size` / `qualified` / `degraded` / `mode` / `gates`）。
+     *   ⚠️ ③a 只是观察期：`qualified` **没有任何代码在读它做决定**。
+     */
+    stats: () => ({
+      ...stats,
+      pending,
+      dir: stickerDir,
+      index: table.stats(),
+      pick: {
+        ...pickConfig,
+        tomlPath: pickSource.tomlPath,
+        fromToml: pickSource.found === true,
+        ...pickStats,
+      },
+      // ③ 的开关（`[sticker_admit]`）：`enabled` / `mode`（恒 `observe`，③b 才会变）。
+      // 放在这里而不是塞进 `candidates`：`enabled=false` 时 `candidates` 是 null，
+      // 而"开关被关掉了"本身正是最需要看得见的那件事。
+      admit: { ...admitSwitch },
+      candidates: candidateTable === null ? null : candidateTable.stats(),
+    }),
   };
 }

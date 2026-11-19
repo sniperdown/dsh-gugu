@@ -142,7 +142,51 @@ function isDuplicateRegistrationError(error) {
 export const DEFAULT_GROUP_DENY_TOOLS = ['pwsh'];
 
 /**
- * 群会话要额外收掉的「宿主全局工具族」（2026-11-04 用户批准）。
+ * **所有** QQ 会话都要收掉的工具（不分群 / 私聊）。
+ *
+ * 与 `DEFAULT_GROUP_DENY_TOOLS` 的区别是**触发条件**，不是危险程度：那份是"群里不该
+ * 能驱动这台机器"，这份是"**走 QQ 这条通道的人根本用不了它**" —— 私聊也一样。
+ *
+ * ## 为什么是这几个
+ *
+ * - `ask_user_question`：会**把选项框弹在这台电脑的屏幕上**。QQ 那边的人看不见那个框，
+ *   于是模型等着一个永远不会有的回答 —— **一调，整个会话卡死**。这是当初单独做
+ *   `gugu` preset 的**首要原因**。（工具名与注册处：`@deepseek-ai/dsh-tool-ask-user`
+ *   的 `lib/index.js:223-224`。）
+ * - `plugin_manager`：`@deepseek-ai/dsh-plugin-manager/tools` **只注册这一个工具**
+ *   （`lib/types/tools.js:75-76`，`name: 'plugin_manager'`，`action` 是参数不是工具名），
+ *   它能改整个 profile 的插件、而且**每次调用都要 `danger-full-access` 审批**
+ *   —— 和 `ask_user_question` 同一种卡死：QQ 上没人能点那个审批框。
+ *   原来靠 `preset-gugu` 里 `- id: tool-plugin-manager / disabled: true` 关掉。
+ *
+ * ## 为什么不在 preset 里关（这条改动的由来）
+ *
+ * 自定义 preset 是**手工镜像** DSH 内置 `standard` 的：DSH 一升级，镜像就跟不上，
+ * 而且**漏了不报错**（`time-context`、`ops` 工具都真漏过）。所以现在改用内置
+ * `standard`，把"QQ 上不能用的工具"改由插件在 agent 作用域收口 —— 那是**代码**，
+ * 跟着 DSH 升级走，不需要人肉对齐。这些工具与挂哪份 preset 无关：内置 preset 会带回它们
+ * （`standard` 的插件表里就有 `tool-plugin-manager` 那一行，这正是 `gugu` 当年要关它的原因）。
+ *
+ * ## ⚠️ 名字必须"真的收得到"
+ *
+ * `restrict()` **一次校验全部名字**，混进一个收不到的，整条限制一起失败。而名单里的
+ * 名字在**当前的 preset 上可能压根没注册**（`gugu` 上 `ask_user_question` 就没有）。
+ * ⇒ 调用方（`alwaysDeniedBackstop`）必须先用 `partitionRestrictable()` 逐个探测，
+ * **用探测结果**去收：收得到才收，收不到只留一条 debug。
+ *
+ * ## 已知缺口（用户已明确接受）
+ *
+ * `restrict` 是 **per-agent** 的，**子会话不继承** —— 机制见上面
+ * `GROUP_PRESET_SUFFIX` 那段（"`tools.restrict()` 是 per-agent 的能力收口"）。
+ * 也就是说小鲸鱼派出去的子会话理论上又把这几个工具拿回来了。之所以接受：
+ * 唯一的"用 preset 一次性解决"的路子正是这条改动要摆脱的东西（手工镜像会漏）；
+ * 而残余风险的代价是**那一次子会话自己卡在等回答上**（不报错，看起来像跑很久），
+ * 不是把父会话的工具表污染掉。等宿主提供"作用域继承的限制"再补这条路。
+ */
+export const ALWAYS_DENY_TOOLS = ['ask_user_question', 'plugin_manager'];
+
+/**
+ * 群会话要额外收掉的「宿主工具族」。
  *
  * 和上面 `DEFAULT_GROUP_DENY_TOOLS` 的关键区别是**注册在哪一层**：
  *
@@ -620,6 +664,36 @@ export function takeNewAssistantSegments(messages, { anchorId = '', seen = new S
     out.push({ key, id, text, index: i });
   }
   return out;
+}
+
+/**
+ * 从事件快照里读出**当前开着的那一轮**的轮号（`0` = 没有开着的轮次）。
+ *
+ * 为什么需要它（2026-11-16）：网关要给「这一轮归谁发」登记一个**轮号**，
+ * 而这个号只有事件里有（`turn/start` / `turn/end` 的 `data.turn`）。
+ * 判据只有一条：最后一个 `turn/start` 之后没有对应的 `turn/end` ⇒ 那一轮还开着。
+ *
+ * ⚠️ 轮号**不能靠猜**（`上一个 turn/end + 1`）：宿主自己也会在同一个会话里起轮次，
+ * 猜错就会把**别人的轮次**登记成"我来发" ⇒ 自动搬运让路、逐段泵又不认领 ⇒ 静默丢话。
+ * 所以调用方必须先确认"本轮提示词已经被宿主收下"（见 `#startSegmentPump` 的 `claim`）。
+ *
+ * @param {Array<any>} events `session.snapshotEvents()` 的结果
+ * @returns {number}
+ */
+export function openTurnOf(events) {
+  const list = Array.isArray(events) ? events : [];
+  let open = 0;
+  for (const event of list) {
+    if (event === null || typeof event !== 'object') continue;
+    if (event.type === 'turn/start') {
+      open = Number(event.data?.turn) || 0;
+    } else if (event.type === 'turn/end') {
+      const ended = Number(event.data?.turn) || 0;
+      // 只有"关掉的正是开着的那一轮"才算关上（乱序/回放里的旧 turn/end 不许误关）。
+      if (ended === 0 || ended === open) open = 0;
+    }
+  }
+  return open;
 }
 
 /**
@@ -1486,6 +1560,79 @@ export class SessionBinder {
   }
 
   /**
+   * 收掉 `ALWAYS_DENY_TOOLS`（QQ 上根本用不了的几个工具）—— **群和私聊都收**。
+   *
+   * ## 为什么不能并进 `groupToolBackstop`
+   *
+   * 那个方法第一句就是 `if (this.kindOf(sessionKey) !== 'group') return false;`，
+   * 私聊根本走不到 —— 而 `ask_user_question` 卡死的是**任何**走 QQ 的会话
+   * （私聊也一样弹框在屏幕上没人点）。触发条件不同，方法就分开。
+   *
+   * ## 为什么逐个探测，而不是直接 `restrict({ deny: ALWAYS_DENY_TOOLS })`
+   *
+   * `restrict()` 一次校验全部名字，**一个收不到就整条失败**；而名单里的名字在
+   * 当前 preset 上可能压根没注册（`gugu` 上就没有 `ask_user_question`，它本来是被
+   * preset 拿掉的）。直接收会抛错，等于什么都没收到、还多一条误导性的 warn。
+   * `partitionRestrictable()` 逐个试、试到就撤销：**收得到才收，收不到记一条 debug**。
+   *
+   * ## 已知缺口
+   *
+   * `restrict` 是 per-agent 的，**子会话不继承**（机制见 `GROUP_PRESET_SUFFIX` 上面那段，
+   * 那里有源码位置与实测）。用户已明确接受这个缺口 —— 彻底解决要么靠 preset
+   * （正是这条改动要摆脱的手工镜像），要么得等宿主提供"作用域继承的限制"。
+   *
+   * ## 幂等
+   *
+   * 和 `restrictGroupHostTools` 同形：台账（随 ctx 生灭）记一笔，同一个 ctx 上不重叠。
+   * ⚠️ 本方法**绝不抛异常**（跑在建会话 / 收养的路径上）。
+   *
+   * @param {any} agentCtx agent 作用域的 ctx
+   * @param {string} sessionKey 会话键，形如 `qq-private-30000001` / `qq-group-30000011`
+   * @param {string} [via] `setup` / `reuse`，只进日志
+   * @returns {boolean} 是否真的挂上了这次限制
+   */
+  alwaysDeniedBackstop(agentCtx, sessionKey, via = 'setup') {
+    const names = ALWAYS_DENY_TOOLS;
+    if (names.length === 0) return false;
+
+    const tools = agentCtx?.tools;
+    if (tools === undefined || tools === null || typeof tools.restrict !== 'function') return false;
+
+    const ledger = registrationLedger(agentCtx);
+    if (ledger !== null && ledger.alwaysDenied === true) return false;
+
+    const { ok, blocked } = partitionRestrictable(tools, agentCtx, names);
+    if (blocked.length > 0) {
+      // 不是故障：那几个工具本来就不在这个 agent 上（preset 没注册它）—— 正是想要的结果。
+      this.log('debug', `${sessionKey} 上没有注册这些工具，跳过收口: ${blocked.join(', ')}`, {
+        sessionKey,
+        via,
+        blocked: blocked.slice(),
+      });
+    }
+    if (ok.length === 0) return false;
+
+    try {
+      // 传副本：名单是长期持有的模块级常量，不该交给宿主去持有。
+      tools.restrict({ deny: ok.slice() });
+      if (ledger !== null) ledger.alwaysDenied = true;
+      this.log('info', `已从 QQ 会话收掉这些工具: ${ok.join(', ')}`, {
+        sessionKey,
+        via,
+        deny: ok.slice(),
+      });
+      return true;
+    } catch (error) {
+      this.log(
+        'warn',
+        `QQ 会话的常收工具限制失败，会话照常建立（本轮不受影响）: ${error instanceof Error ? error.message : String(error)}`,
+        { sessionKey, via, deny: ok.slice() },
+      );
+      return false;
+    }
+  }
+
+  /**
    * 按需加载（2026-11-04）：把「不常驻」的工具收进目录，模型要用时用 `load_tools` 取回。
    *
    * ## 它省的是什么
@@ -2180,6 +2327,10 @@ export class SessionBinder {
     if (existing === undefined) return false;
     // 群会话的工具收口（理由见 `groupToolBackstop` 自己的说明）。
     this.groupToolBackstop(existing.ctx, sessionKey, via, this.livePresetOf(existing.ctx));
+    // 常收的那几个（`ask_user_question` / `plugin_manager`）同样要在这里补一次：
+    // 复用不经过 setup，而这条收口是挂在 agentCtx 上的 effect —— 热重载之后旧 ctx
+    // 上的限制随 ctx 消失，不补就等于"安静地还回来"。（单独一行，理由见 setup 那处。）
+    this.alwaysDeniedBackstop(existing.ctx, sessionKey, via);
     this.registerSendTool(existing.ctx, sessionKey, via);
     this.registerLookTool(existing.ctx, sessionKey, via);
     this.registerVoiceTool(existing.ctx, sessionKey, via);
@@ -2482,6 +2633,9 @@ export class SessionBinder {
       // —— 读 live 作用域链问出来（`composedPreset`），问不到就按"没挂群 preset"处理，
       // 也就是**兜**。方向是安全的那一侧：宁可多一条多余的 warn，也别漏了收口。
       this.groupToolBackstop(existing.ctx, sessionKey, 'reuse', this.livePresetOf(existing.ctx));
+      // 常收的那几个工具（`ask_user_question` / `plugin_manager`）也要在这里补：
+      // 收养这条路不经过 setup，理由与上面那条 group 收口完全相同（单独一行，同上）。
+      this.alwaysDeniedBackstop(existing.ctx, sessionKey, 'reuse');
       // 2026-11-04：按需加载也要在这里补（复用不经过 setup；理由同下面的工具注册）。
       this.setupOnDemandTools(existing.ctx, sessionKey, 'reuse');
       this.registerSendTool(existing.ctx, sessionKey, 'reuse');
@@ -2571,6 +2725,11 @@ export class SessionBinder {
       // 挂上了还硬叠 —— `restrict` 收不了 preset 没注册的名字，只会每次会话
       // 打一条误导性的 warn（理由与源码依据见 `groupToolBackstop`）。
       this.groupToolBackstop(agentCtx, sessionKey, 'setup', mounted);
+      // QQ 上根本用不了的几个工具（`ask_user_question` 把选项框弹在电脑屏幕上、
+      // `plugin_manager` 每次调用都要一次桌面审批）：**不分群 / 私聊都收**。
+      // ⚠️ **单独一行**，不许写成 `groupToolBackstop(...) || alwaysDeniedBackstop(...)`：
+      // 前者返回 true 时 `||` 会把后面那句整个短路掉（私聊根本走不到，群也只剩一半）。
+      this.alwaysDeniedBackstop(agentCtx, sessionKey, 'setup');
       this.registerSendTool(agentCtx, sessionKey, 'setup');
       // 发之前看一眼表情包（2026-10-19）：同样只挂她这一层。
       this.registerLookTool(agentCtx, sessionKey, 'setup');
@@ -2884,14 +3043,50 @@ export class SessionBinder {
    *   不给 = 只在轮末返回最后一段（改动前的行为）。
    * @returns {Promise<string>} 助手本轮发言；本轮没说话则空串
    */
-  async runTurn({ sessionKey, prompt, signal, source = 'dsh-qq-proactive', imageBlocks = [], chatId = '', onSegment = null }) {
+  /**
+   * 忙时插话（2026-11-16）：把一条用户消息作为 DSH 的 steering 投进**正在跑的那一轮**。
+   *
+   * `agent.steer()` 是宿主公开的插话入口（下一 step 可见，不打断当前轮）；
+   * `followup()` 才是"下一轮"。之前的 `runTurn` 只走 followup 并 `await whenIdle()`，
+   * 所以会话忙时消息必然等整轮结束 —— 这就是"即时性没了"的根源。
+   *
+   * 返回 false 的三种情况都让调用方回退排队：没有活 handle、agent 已不在跑、
+   * 宿主没暴露 `steer`。**插话失败不能丢消息。**
+   *
+   * @param {{sessionKey: string, prompt: string, imageBlocks?: object[]}} request
+   * @returns {Promise<boolean>} true = 已投进当前轮
+   */
+  async steer({ sessionKey, prompt, imageBlocks = [] } = {}) {
+    const key = String(sessionKey ?? '');
+    if (key === '') return false;
+    const cached = this.live.get(key);
+    if (cached === undefined || cached === null) return false;
+    const agent = cached.handle?.agent;
+    if (agent === null || agent === undefined || typeof agent.steer !== 'function') return false;
+    // 只在"真的在跑"时插话；空闲时交给调用方排队更稳（也避免 steer 落进空轮）。
+    if (agent.status !== 'running') return false;
+    try {
+      const finalPrompt = this.#injectKnowledge(key, prompt);
+      const message = this.#buildMessage({ prompt: finalPrompt, imageBlocks });
+      agent.steer(message);
+      return true;
+    } catch (error) {
+      this.log('warn', '插话失败（回退排队）', {
+        sessionKey: key,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  async runTurn({ sessionKey, prompt, signal, source = 'dsh-qq-proactive', imageBlocks = [], chatId = '', onSegment = null, onTurn = null }) {
     // 注入知识：检索用户消息里的概念 + 发言人画像，让小鲸鱼"认识人、记得事"。
     const finalPrompt = this.#injectKnowledge(sessionKey, prompt);
     // 同一会话串行。
     const previous = this.locks.get(sessionKey);
     if (previous !== undefined) await previous.catch(() => undefined);
 
-    const task = this.#runTurnInner({ sessionKey, prompt: finalPrompt, signal, source, imageBlocks, chatId, onSegment });
+    const task = this.#runTurnInner({ sessionKey, prompt: finalPrompt, signal, source, imageBlocks, chatId, onSegment, onTurn });
     // 2026-10-21：`finally` 里比较的必须是**存进 map 的那个包装 promise**，
     // 不能是原始 `task` —— 两者永远不 `===`，于是这一行永远不会删锁。
     //
@@ -3177,7 +3372,7 @@ export class SessionBinder {
     }
   }
 
-  async #runTurnInner({ sessionKey, prompt, signal, source, imageBlocks = [], chatId = '', onSegment = null }) {
+  async #runTurnInner({ sessionKey, prompt, signal, source, imageBlocks = [], chatId = '', onSegment = null, onTurn = null }) {
     if (signal?.aborted === true) throw new Error('本轮已被取消');
 
     // P2-6：把 chatId 交给 `ensure` —— 它才是决定"用旧 id 还是新分配一个"的地方
@@ -3235,8 +3430,10 @@ export class SessionBinder {
     const promptMessage = this.#buildMessage({ prompt, imageBlocks });
     const promptId = promptMessage !== null && typeof promptMessage.id === 'string' ? promptMessage.id : '';
     // 逐段外发（2026-11-04）：调用方给了 `onSegment` 才开 —— 不给 = 行为与改动前逐字相同。
+    // `onTurn`（2026-11-16）：同一个泵顺手认出"这一轮是第几轮"并报给调用方（网关），
+    // 网关据此把"归谁发"从**会话**改成**轮**（见 `openTurnOf` 与 `claim` 的说明）。
     const pump = typeof onSegment === 'function'
-      ? this.#startSegmentPump({ agent, anchorId: promptId, sessionKey, onSegment })
+      ? this.#startSegmentPump({ agent, anchorId: promptId, sessionKey, onSegment, onTurn })
       : null;
     try {
       agent.followup(promptMessage);
@@ -3437,9 +3634,11 @@ export class SessionBinder {
    * @param {string} options.anchorId 本轮用户消息 id（找不到就靠 `preIds` 兜底）
    * @param {string} options.sessionKey 只用于日志
    * @param {(text: string, step: number) => Promise<void>} options.onSegment
-   * @returns {{count: () => number, flush: () => Promise<void>, stop: () => Promise<void>}}
+   * @param {((turn: number) => void)|null} [options.onTurn] 认出"这一轮是第几轮"时报一次
+   *   （2026-11-16：网关靠它把"归谁发"的判据从**会话**改成**轮**）。
+   * @returns {{count: () => number, turn: () => number, flush: () => Promise<void>, stop: () => Promise<void>}}
    */
-  #startSegmentPump({ agent, anchorId, sessionKey, onSegment }) {
+  #startSegmentPump({ agent, anchorId, sessionKey, onSegment, onTurn = null }) {
     /** 本轮开始前就在 surface 里的助手消息 id（压缩后仍要挡住的那些旧话）。 */
     const preIds = new Set();
     for (const message of this.readMessages(agent)) {
@@ -3449,18 +3648,67 @@ export class SessionBinder {
     const seen = new Set();
     let count = 0;
     let stopped = false;
+    /** 这一轮的轮号（`0` = 还没认出来 / 宿主没给事件）。 */
+    let turn = 0;
+
+    /**
+     * **认出「这一轮属于我」**（2026-11-16）。
+     *
+     * 判据只有一条：**本轮提示词已经被宿主收下**（进了 `deriveMessages()`）——
+     * 那意味着消费它的那一轮已经开始了；此刻**开着的**那一轮就是我的。
+     *
+     * 为什么不能用"下一个 `turn/start` 就是我的"：插件的一轮可能**先占住会话、提示词
+     * 排在队里**（「她自己的时间」/ 内部通道），期间宿主自己起的轮次（子会话交活、
+     * 后台作业结束）会先跑完 —— 把那个 `turn/start` 认成自己的，就会让自动搬运
+     * 为**别人的轮次**让路（2026-11-16 turn 2746 那 683 字就是这么没的）。
+     *
+     * 认不出来（宿主没给 `snapshotEvents` / 提示词是被别的路径消费的）⇒ **不登记**：
+     * 宁可让自动搬运照常发，也不能凭空吞掉一轮。
+     *
+     * @param {any[]} messages 本次扫描读到的派生消息
+     */
+    const claim = (messages) => {
+      if (turn > 0 || typeof onTurn !== 'function') return;
+      const list = Array.isArray(messages) ? messages : [];
+      let consumed = false;
+      for (const message of list) {
+        if (message !== null && typeof message === 'object' && anchorId !== '' && message.id === anchorId) {
+          consumed = true;
+          break;
+        }
+      }
+      if (!consumed) return;
+      const open = openTurnOf(this.#readEvents(agent));
+      if (open <= 0) return;
+      turn = open;
+      try {
+        onTurn(open);
+      } catch (error) {
+        // 登记失败只影响"谁发"的判据（最坏是多发一条，同文短窗还会再挡一层），绝不把轮次弄抛。
+        this.log('warn', `登记本轮轮号失败（这一轮可能被自动搬运重复搬一次）${sessionKey}`, {
+          turn: open,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
     /** 串行化：两次扫描不会同时把同一段交出去，也不会乱序。 */
     let chain = Promise.resolve();
 
     const once = async () => {
-      const found = takeNewAssistantSegments(this.readMessages(agent), { anchorId, seen, preIds });
+      const messages = this.readMessages(agent);
+      claim(messages);
+      const found = takeNewAssistantSegments(messages, { anchorId, seen, preIds });
       for (const segment of found) {
         // ⚠️ **先登记再 await**：发送可能失败，但"试图发过"就算用掉了这一段 ——
         // 否则失败的那段会在下一次扫描里被再发一遍（超时但真到了 = QQ 上两条）。
         seen.add(segment.key);
         count += 1;
         try {
-          await onSegment(segment.text, count);
+          // 第三个参数（2026-11-16）：这一段的**助手消息 id**。网关切它登记
+          // "这一段归逐段泵了"，自动搬运据此整轮让路 —— 防"多段轮发两遍"
+          // （整串 ≠ 单段，同文短窗挡不住）。老调用方只收两个参数，多余参数它自己忽略。
+          await onSegment(segment.text, count, { id: segment.id });
         } catch (error) {
           // `onSegment` 自己该吞异常；这里再兜一层，逐段发送坏了**不能**把整轮弄抛。
           this.log('warn', `第 ${count} 段外发失败（后续段照常发）${sessionKey}`, {
@@ -3491,6 +3739,8 @@ export class SessionBinder {
 
     return {
       count: () => count,
+      /** 这一轮的轮号（`0` = 没认出来）。只给日志 / 调试看，不参与发送决策。 */
+      turn: () => turn,
       flush,
       /**
        * 收尾：停掉轮询，再做**最后一次**扫描。
@@ -3703,6 +3953,19 @@ export class SessionBinder {
     return messages;
   }
 
+  /** 安全读取事件快照；任何失败都退化成空数组（拿不到 = 不登记轮号，绝不影响这一轮）。 */
+  #readEvents(agent) {
+    try {
+      const session = agent?.session;
+      if (session === undefined || session === null) return [];
+      if (typeof session.snapshotEvents !== 'function') return [];
+      const events = session.snapshotEvents();
+      return Array.isArray(events) ? events : [];
+    } catch {
+      return [];
+    }
+  }
+
   /** 安全读取派生消息；任何失败都退化成空数组而不是炸掉一轮。 */
   readMessages(agent) {
     try {
@@ -3728,8 +3991,11 @@ export class SessionBinder {
     // 并且注入了 `ctx.attachments`。绑定层只负责把它塞进消息内容。
     // `chatId`（P2-6）：交给 `ensure` 决定"旧 id 还是新分配"，并写映射表。
     // `onSegment`（2026-11-04）：逐段外发的回调，由网关注入（它才是走 `#send` 的那一层）。
-    return async ({ sessionKey, chatId = '', prompt, signal, imageBlocks = [], onSegment = null }) =>
-      this.runTurn({ sessionKey, chatId, prompt, signal, imageBlocks, onSegment });
+    // `onTurn`（2026-11-16）：轮归属的登记口，同样由网关注入 —— **必须一起转给 `runTurn`**，
+    //   漏了这一行就等于"网关递了牌子、绑定层没接"，`isTurnInFlight(key, turn)` 永远认不出
+    //   自己那一轮（自动搬运会把插件自己发过的轮次再搬一遍）。
+    return async ({ sessionKey, chatId = '', prompt, signal, imageBlocks = [], onSegment = null, onTurn = null }) =>
+      this.runTurn({ sessionKey, chatId, prompt, signal, imageBlocks, onSegment, onTurn });
   }
 
   /**

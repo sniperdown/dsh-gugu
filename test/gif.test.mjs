@@ -195,7 +195,7 @@ test('selectKeyFrames：帧数不够时全给；数量非法时退回默认', ()
   assert.equal(selectKeyFrames(thumbs, { count: 0 }).indices.length, 2);
   assert.equal(selectKeyFrames(thumbs, { count: 99 }).indices.length, 2);
   // 默认值 = 报告里说明过的那个（4 帧：首 + 末 + 2 个最大变化）
-  assert.equal(DEFAULT_SHEET_FRAMES, 4);
+  assert.equal(DEFAULT_SHEET_FRAMES, 16);
 });
 
 // ─────────────────────────────────────────────────────────── 缩放与拼图
@@ -226,6 +226,24 @@ test('composeSheet：横向拼接 + 留缝 + 透明处用背景色合成', () =>
   assert.deepEqual(Array.from(blended.rgba), [255, 255, 255, 255]);
 
   assert.equal(composeSheet([]), null, '空输入返回 null，不抛');
+});
+
+test('composeSheet：给 columns 就排成网格（4 个 1×1 排 2×2，十字缝是背景色）', () => {
+  const solid = (v) => ({ width: 1, height: 1, rgba: new Uint8Array([v, v, v, 255]) });
+  const sheet = composeSheet([solid(10), solid(20), solid(30), solid(40)], { gap: 1, background: 255, columns: 2 });
+  assert.equal(sheet.width, 3, '2 列 + 1 条缝');
+  assert.equal(sheet.height, 3, '2 行 + 1 条缝');
+  const at = (x, y) => Array.from(sheet.rgba.subarray((y * sheet.width + x) * 4, (y * sheet.width + x) * 4 + 4));
+  assert.deepEqual(at(0, 0), [10, 10, 10, 255], '左上');
+  assert.deepEqual(at(2, 0), [20, 20, 20, 255], '右上');
+  assert.deepEqual(at(0, 2), [30, 30, 30, 255], '左下');
+  assert.deepEqual(at(2, 2), [40, 40, 40, 255], '右下');
+  assert.deepEqual(at(1, 1), [255, 255, 255, 255], '十字缝');
+
+  // columns 缺省 / 非法 ⇒ 全横排（改网格之前的老行为）
+  const flat = composeSheet([solid(10), solid(20), solid(30)], { gap: 1 });
+  assert.equal(flat.width, 5);
+  assert.equal(flat.height, 1);
 });
 
 // ─────────────────────────────────────────────────────────── PNG 编码
@@ -280,6 +298,19 @@ test('★ buildGifSheet：六帧 → 一张 PNG，首末帧都在，尺寸符合
   assert.equal(got.height, 120);
   assert.deepEqual(Array.from(got.png.subarray(0, 8)), [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   assert.ok(got.avgDiff > 0, '应当算出平均差异率（进日志，便于事后看"这张到底动没动"）');
+});
+
+test('★ buildGifSheet：**拼图改成网格了** —— 6 帧排 4 列 2 行，帧数不够不硬凑格子', () => {
+  const six = buildGifSheet(raw(GIF_6FRAMES), { maxFrames: 6 });
+  assert.equal(six.ok, true);
+  // 每帧 = min(单帧上限 512, 原宽 200, 每列可用 344) = 200；高 = 200 × (120/200) = 120
+  assert.equal(six.width, 4 * 200 + 3 * 8, '4 列 + 3 条缝');
+  assert.equal(six.height, 2 * 120 + 8, '2 行 + 1 条缝');
+
+  // 默认帧数现在是 16，但这张只有 6 帧 ⇒ 不许硬凑空格子，还是 4×2
+  const byDefault = buildGifSheet(raw(GIF_6FRAMES));
+  assert.equal(byDefault.width, six.width, '默认值改了，但"没那么多帧"时仍然是 4×2');
+  assert.equal(byDefault.height, six.height);
 });
 
 test('buildGifSheet：**宽图必须把每帧缩小**，总宽不能超上限', () => {

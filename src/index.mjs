@@ -67,6 +67,8 @@ import { createStickerAudit, normalizeStickerAudit, DEFAULT_STICKER_AUDIT } from
 // ⚠️ **这次刻意不去重、不加重试**（重复在哪一层还不知道，两者都会**掩盖**它）。
 // 判读方式与理由见 `outbound-ledger.mjs` 的模块头。
 import { createOutboundLedger, DEFAULT_OUTBOUND_LEDGER_PATH } from './dsh/outbound-ledger.mjs';
+// 出站文本判据（2026-11-18，实验性观测）：只往台账记"疑似近字错"，不改文本、不拦截。
+import { createTextLinter, DEFAULT_TEXT_LINT_URL } from './dsh/text-lint.mjs';
 // 语音转文字（B4 真答案，2026-10-25）：NapCat 的 record 段**没有转写**，
 // 用本机 faster-whisper 转一次（SILK→WAV 由 NapCat 的 `get_record` 负责）。
 import { createVoiceTranscriber, DEFAULT_VOICE } from './dsh/voice.mjs';
@@ -1471,6 +1473,43 @@ export function apply(ctx, rawConfig = {}) {
     log,
   });
 
+  // ── 出站文本判据（2026-11-18，实验性）──
+  //
+  // 目的只有一个：**先把留痕做出来**。判据本身（jieba 词表法）实测 12 个构造错例
+  // 检出 10 个、30 句正常文本误报 10 句 —— 这一版不修文本、不拦消息、不提示用户，
+  // 只往台账记一行 `text-lint`，之后才能统计"到底准不准"。
+  //
+  // 三条铁律（在 `dsh/text-lint.mjs` 和 `gateway.mjs` 的 `textLint` 参数上都写了）：
+  //   1. **绝不 await 在发送路径上**；2. **任何失败静默降级**；3. **回调自己吞异常**。
+  //
+  // ⚠️ 配置走**环境变量**，不进 `CONFIG_SHAPE`：它是实验设施，
+  //    要能在不改 toml、不重启 profile 的情况下关掉。
+  //    · `QQ_TEXT_LINT_DISABLE=1` 关掉整个判据
+  //    · `QQ_TEXT_LINT_URL` 换地址
+  //    · `QQ_TEXT_LINT_SPAWN=1` 让插件自己拉起/杀掉服务（**默认不开** ——
+  //      17 个测试文件会 `apply()` 整个插件，默认开就等于每次 `npm test`
+  //      都拉起一堆 Python；而且 Windows 的 `SO_REUSEADDR` 让"撞端口"防不住重复）
+  // ⚠️ 它**不是必需品**：spawn 失败 / 服务没起 / 超时 ⇒ 台账少一行，别的一律照旧。
+  const textLintEnv = process.env ?? {};
+  const textLint = createTextLinter({
+    config: {
+      enabled: String(textLintEnv.QQ_TEXT_LINT_DISABLE ?? '') !== '1',
+      url: textLintEnv.QQ_TEXT_LINT_URL ?? DEFAULT_TEXT_LINT_URL,
+      spawn: String(textLintEnv.QQ_TEXT_LINT_SPAWN ?? '0') === '1',
+      python: textLintEnv.QQ_TEXT_LINT_PYTHON ?? undefined,
+    },
+    log,
+  });
+  // 起服务（spawn 失败只记 warn，不抛）——**必须在 gateway 构造之前**，
+  // 这样第一批消息就可能拿到结果；晚起的窗口里 `svc:'down'`，那也是一种数据。
+  try {
+    textLint.start();
+  } catch (error) {
+    log('warn', '文本判据服务启动失败（发送不受影响）', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
   // ── `QQ → 昵称` 表（2026-10-14）──
   //
   // 一句话：**NapCat 的 at 段不给名字，所以自己攒**（理由见 `nicknames.mjs` 模块头）。
@@ -1860,6 +1899,9 @@ export function apply(ctx, rawConfig = {}) {
     // 为 null 时**什么都不记**、也不挂钩（收消息回消息照旧）——
     // 同 `stickerLibrary`：它**不是**必需品。
     outboundLedger,
+    // 出站文本判据（2026-11-18）：网关用它 fire-and-forget 地补记 `text-lint` 一行。
+    // 为 null 时一行都不记 —— 它**不是**必需品（同 `outboundLedger` 那条规矩）。
+    textLint,
     // `QQ → 昵称` 表：入站时学、渲染 @ 段时查（`@30000002` → `@小鲸鱼`）。
     // 为 null 时两个方向都不做 ⇒ @ 段落回退成 `@QQ号`（它**不是**必需品）。
     nicknames,
@@ -1967,6 +2009,10 @@ export function apply(ctx, rawConfig = {}) {
   // `free-time` 自己只认**用户 QQ** 发的那条（群友说话不是"用户说话"），
   // 别处的判定不重复一遍 —— 两处记就会漂移。
   gateway.onUserMessage = freeTime === null ? null : (message) => freeTime.noteUserMessage(message);
+  // 「她自己最后一条出站」的汇合点（2026-11-18）：`#sendOne` 发送成功之后问一次。
+  // 短追问的基准 = `max(用户最后一条入站, 她最后一条出站)` —— 她刚说完话就别追。
+  // 同样只由 `free-time` 判"算不算数"（它只认私聊），别处不重复一遍。
+  gateway.onSelfMessage = freeTime === null ? null : (message) => freeTime.noteSelfMessage(message);
   if (freeTime !== null && freeTimeCfg.enabled === true) {
     ctx.effect(
       () =>
@@ -3037,6 +3083,18 @@ export function apply(ctx, rawConfig = {}) {
         recallStore.dispose();
         relationLedger.dispose();
         topicStore.dispose();
+      } catch {
+        /* 收尾失败不影响卸载 */
+      }
+      // 文本判据服务（2026-11-18）：杀掉我们自己 spawn 的那个 Python。
+      //
+      // 两道保险，缺一不可：
+      //   ① 这里主动 kill（并且先 `stdin.end()`）—— 让重载后的新实例能**立刻**
+      //      重新绑同一个端口，而不是先撞一次"端口被占"；
+      //   ② 服务自己的 `--parent-stdin` watchdog —— 万一本函数没跑到
+      //      （崩溃 / 强杀），stdin 管道一断它就自己退出，不留孤儿进程。
+      try {
+        textLint.dispose();
       } catch {
         /* 收尾失败不影响卸载 */
       }

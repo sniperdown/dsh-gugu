@@ -273,7 +273,8 @@ function gatewayHarness(table) {
     transport,
     router,
     engine,
-    outboundAllow: null,
+    relay: null,
+    relayAllow: null,
     responder: async (request) => { prompts.push(request.prompt); return '收到'; },
     log: () => {},
     nicknames: table,
@@ -328,7 +329,9 @@ test('★ 网关：别人 @小鲸鱼 ⇒ 送进会话的正文是 `@小鲸鱼`�
       raw_message: `[CQ:at,qq=${SELF}] 在吗`,
     }));
     assert.equal(r.outcome, OUTCOME.DISPATCHED, `@ 了小鲸鱼就该派发，实际 ${JSON.stringify(r)}`);
-    const entry = h.engine.transcript('group:30000012').snapshot().at(-1);
+    // ⚠️ 2026-11-10：转录现在也会写**她自己发出去的那句**（`fromSelf`），所以"最后一条"
+    // 不再是这条入站消息 —— 按 `messageId` 找，钉的仍然是她看到的那个形状。
+    const entry = h.engine.transcript('group:30000012').snapshot().find((m) => m.messageId === 2);
     assert.equal(entry.text, '@小鲸鱼 在吗', '转录里那一行必须是 @小鲸鱼');
     assert.match(h.prompts.at(-1), /@小鲸鱼 在吗/, '提示词里也必须是 @小鲸鱼');
   } finally {
@@ -345,7 +348,7 @@ test('网关：没给表 ⇒ 一切照旧（`@QQ号`），而且绝不抛', asyn
       raw_message: `[CQ:at,qq=${SELF}] 在吗`,
     }));
     assert.equal(r.outcome, OUTCOME.DISPATCHED);
-    const entry = h.engine.transcript('group:30000012').snapshot().at(-1);
+    const entry = h.engine.transcript('group:30000012').snapshot().find((m) => m.messageId === 3);
     assert.equal(entry.text, `@${SELF} 在吗`);
   } finally {
     h.gateway.stop();
@@ -365,7 +368,7 @@ test('网关：学的动作**抛异常也不影响处理这条消息**（热路�
       raw_message: `[CQ:at,qq=${SELF}] 在吗`,
     }));
     assert.equal(r.outcome, OUTCOME.DISPATCHED, '表炸了也要照常处理消息');
-    const entry = h.engine.transcript('group:30000012').snapshot().at(-1);
+    const entry = h.engine.transcript('group:30000012').snapshot().find((m) => m.messageId === 4);
     assert.equal(entry.text, `@${SELF} 在吗`, '查表抛异常 ⇒ 退化成 @QQ号');
   } finally {
     h.gateway.stop();

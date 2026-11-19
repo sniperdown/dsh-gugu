@@ -721,11 +721,14 @@ test('★ stats：没跑过时 lastRunAt=null、sessionKey 是映射后的键，
     lastRunAt: null,
     // 2026-10-23 新增：长短两个钟的锚点与"这轮沉默追问过没有"。
     lastUserMessageAt: null,
+    // 2026-11-18 新增：短追问的计时基准取 max(用户最后一条入站, 她自己最后一条出站)。
+    lastSelfMessageAt: null,
     followupDone: true,
     nextFollowupAt: null,
     lastFollowupAt: null,
     lastWakeKind: null,
     userMessages: 0,
+    selfMessages: 0,
     // 2026-10-26 新增：短追问只由**私聊**重新上膛；群消息只推进长唤醒锚点。
     // 这三个字段就是"为什么没被上膛"在快照里的唯一证据。
     lastUserMessageChat: '',
@@ -1111,6 +1114,14 @@ function userMessage(at, chatId = PRIVATE) {
   return { userId: OWNER, at, chatId };
 }
 
+/**
+ * 一条"她自己发出去的"出站（`gateway.onSelfMessage` 递过来的形状，2026-11-18）。
+ * 只有 `{chatId, at}` 两个字段 —— 网关不该多递，`free-time` 也不该多看。
+ */
+function selfMessage(at, chatId = PRIVATE) {
+  return { chatId, at };
+}
+
 /** 群里的用户发言（只该推进长唤醒锚点，**不该**给短追问上膛）。 */
 function groupUserMessage(at) {
   return userMessage(at, 'group:200000001');
@@ -1424,4 +1435,107 @@ test('★ 落盘失败 ⇒ 进 `lastError` + 计数（内存 true / 磁盘 false
   assert.ok(s.persistFailures >= 1, '失败要计数');
   assert.match(String(s.lastError), /没存上/);
   assert.match(String(s.lastError), /丢锁/, '错误文案要说清后果');
+});
+
+// ============================================ 2026-11-18：短追问的计时基准（用户报的 bug）
+//
+// 用户原话：「插件的追问轮看的是**我给你发消息之后**过的时间，不是**我发完消息之后**过的时间。」
+// ⇒ 基准 = max(用户最后一条入站, 她自己最后一条出站)。**触发条件本身一个字节没改**：
+// 还是 `followupMinutes`（默认 10）、还是要 `followupDone === false`、不查 busy。
+
+test('★ ① 用户很久没说话、但她刚发完 ⇒ 追问轮不触发', async () => {
+  const { ft, clock, gateway } = harness({ t0: localAt(10), cfg: { intervalHours: 2 } });
+  await tickNoThrow(ft); // 10:00 长唤醒
+
+  // 10:30 用户说话（上膛，基准 10:30）；10:35 她自己回了一句（基准该推到 10:35）
+  clock.set(localAt(10, 30));
+  assert.equal(ft.noteUserMessage(userMessage(clock.now)), true);
+  clock.set(localAt(10, 35));
+  assert.equal(ft.noteSelfMessage(selfMessage(clock.now)), true, '她刚说完一句');
+  assert.equal(ft.stats().nextFollowupAt, new Date(localAt(10, 45)).toISOString());
+
+  // 10:40 —— 按**老口径**（只看用户入站）这里正好到点，现在必须是"还太早"
+  clock.set(localAt(10, 40));
+  assert.equal((await tickNoThrow(ft)).reason, 'short-too-soon', '她刚说完话 ⇒ 不该追问');
+  assert.equal(gateway.calls.deliver, 1, '除了 10:00 那次长唤醒，一条都没发');
+  // 10:44 仍太早（距她那句 9 分钟）
+  clock.set(localAt(10, 44));
+  assert.equal((await tickNoThrow(ft)).reason, 'short-too-soon');
+  // 10:45 = 她那句之后整 10 分钟 ⇒ 这才该问
+  clock.set(localAt(10, 45));
+  assert.equal((await tickNoThrow(ft)).woke, true);
+  assert.equal(ft.stats().lastWakeKind, 'short');
+  assert.equal(gateway.calls.deliver, 2);
+});
+
+test('★ ② 她没再说话、用户那条到点了 ⇒ 照常触发（触发条件没动）', async () => {
+  const { ft, clock, gateway } = harness({ t0: localAt(10), cfg: { intervalHours: 2 } });
+  await tickNoThrow(ft); // 10:00 长唤醒
+
+  clock.set(localAt(10, 30));
+  ft.noteUserMessage(userMessage(clock.now));
+  clock.set(localAt(10, 39));
+  assert.equal((await tickNoThrow(ft)).reason, 'short-too-soon');
+  clock.set(localAt(10, 40));
+  assert.equal((await tickNoThrow(ft)).woke, true);
+  assert.equal(ft.stats().lastWakeKind, 'short');
+  assert.equal(gateway.calls.deliver, 2);
+});
+
+test('★ ③ 两者都有 ⇒ 取更晚的那个（两个方向都钉住）', async () => {
+  // 方向 A：她那句更晚
+  const a = harness({ t0: localAt(10), cfg: { intervalHours: 2 } });
+  a.clock.set(localAt(10, 30));
+  a.ft.noteUserMessage(userMessage(a.clock.now));
+  a.clock.set(localAt(10, 52));
+  a.ft.noteSelfMessage(selfMessage(a.clock.now));
+  assert.equal(a.ft.stats().lastUserMessageAt, new Date(localAt(10, 30)).toISOString(), '用户那条照旧记着');
+  assert.equal(a.ft.stats().lastSelfMessageAt, new Date(localAt(10, 52)).toISOString());
+  assert.equal(a.ft.stats().nextFollowupAt, new Date(localAt(11, 2)).toISOString(), '取 10:52');
+
+  // 方向 B：用户那条更晚 ⇒ 基准不能被更早的出站拽回去
+  const b = harness({ t0: localAt(10), cfg: { intervalHours: 2 } });
+  b.clock.set(localAt(10, 52));
+  assert.equal(b.ft.noteSelfMessage(selfMessage(b.clock.now)), true);
+  b.clock.set(localAt(11));
+  assert.equal(b.ft.noteUserMessage(userMessage(b.clock.now)), true);
+  assert.equal(b.ft.stats().nextFollowupAt, new Date(localAt(11, 10)).toISOString(), '取 11:00');
+  // 乱序 / 补发更早的出站 ⇒ 忽略，别把基准往回拨
+  assert.equal(b.ft.noteSelfMessage(selfMessage(localAt(10, 40))), false);
+  assert.equal(b.ft.stats().lastSelfMessageAt, new Date(localAt(10, 52)).toISOString());
+  assert.equal(b.ft.stats().nextFollowupAt, new Date(localAt(11, 10)).toISOString());
+  // 只有她说过话、用户从来没说 ⇒ 短钟根本不存在（触发条件没变：`lastUserMessageAt === null` 仍早退）
+  const c = harness();
+  assert.equal(c.ft.noteSelfMessage(selfMessage(localAt(10))), true);
+  assert.equal(c.ft.stats().nextFollowupAt, null);
+});
+
+test('④ 只有私聊出站算数；基准跨重启（热重载）读得回来', async () => {
+  const dir = shotDir();
+  const statePath = path.join(dir, 'free-time-state.json');
+  const one = harness({ t0: localAt(10), statePath, cfg: { intervalHours: 2 } });
+  await tickNoThrow(one.ft); // 10:00 长唤醒
+
+  one.clock.set(localAt(10, 30));
+  one.ft.noteUserMessage(userMessage(one.clock.now));
+  one.clock.set(localAt(10, 34));
+  assert.equal(one.ft.noteSelfMessage({ chatId: 'group:200000001', at: one.clock.now }), false, '群里的出站不算');
+  assert.equal(one.ft.noteSelfMessage({ at: one.clock.now }), false, '没有 chatId ⇒ fail-closed');
+  assert.equal(one.ft.stats().lastSelfMessageAt, null);
+  assert.equal(one.ft.stats().selfMessages, 0);
+  assert.equal(one.ft.stats().nextFollowupAt, new Date(localAt(10, 40)).toISOString());
+
+  one.clock.set(localAt(10, 38));
+  assert.equal(one.ft.noteSelfMessage(selfMessage(one.clock.now)), true);
+  assert.equal(
+    JSON.parse(fs.readFileSync(statePath, 'utf8')).lastSelfMessageAt,
+    new Date(localAt(10, 38)).toISOString(),
+    '基准要落盘（热重载之后"她刚说完话"这条事实不能丢）',
+  );
+
+  // 热重载：10:42 新实例 ⇒ 距她那句才 4 分钟，不该追问
+  const two = harness({ t0: localAt(10, 42), statePath, cfg: { intervalHours: 2 } });
+  assert.equal(two.ft.stats().lastSelfMessageAt, new Date(localAt(10, 38)).toISOString());
+  assert.equal(two.ft.stats().nextFollowupAt, new Date(localAt(10, 48)).toISOString());
+  assert.equal((await tickNoThrow(two.ft)).reason, 'short-too-soon');
 });

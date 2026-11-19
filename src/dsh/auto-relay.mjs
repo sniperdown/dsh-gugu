@@ -22,8 +22,12 @@
  * ## 判据（一句话）
  *
  * `turn/end` 时，**这个会话能映射到白名单里的 QQ chatId** + **这一轮不是插件自己驱动的**
- * （`gateway.isTurnInFlight()` ⇒ 那是 `runTurn` 的路，它自己会发）+ **这一轮的最后一段
+ * （`gateway.isTurnInFlight(session, turn)` ⇒ 那是 `runTurn` 的路，它自己会发）+ **这一轮的最后一段
  * 助手正文非空** + **不是 `[不说话]`** + **这一轮没调过发文字的工具** ⇒ 发。
+ *
+ * ⚠️ "不是插件自己驱动的"这个判据必须**带上轮号**（2026-11-16）。网关的牌子按会话举，
+ * 而插件的一轮可能还没轮到（提示词排在队里）—— 只按会话判会把宿主自己跑的那一轮当成
+ * "插件会自己发"而让路，结果谁都没发（turn 2746 丢了 683 字）。
  *
  * ## 为什么"不是插件自己驱动的"这一条是**必须**的（定时唤醒的护栏）
  *
@@ -79,6 +83,31 @@ export function turnHasTextToolCall(events, turn, toolNames = TEXT_SEND_TOOL_NAM
 }
 
 /**
+ * 取**这一轮**助手消息的 id 列表（按出现顺序）。
+ *
+ * 与 `allAssistantTextOfTurn` 同一份读法、同一份 id 语义（`data.message.id`），
+ * 只是要 id 而不是正文 —— 自动搬运用它问网关"这一轮是不是已经由逐段泵接手了"。
+ *
+ * @param {Array<any>} events `session.snapshotEvents()`
+ * @param {number} turn
+ * @returns {string[]}
+ */
+export function assistantMessageIdsOfTurn(events, turn) {
+  const list = Array.isArray(events) ? events : [];
+  const target = Number(turn);
+  if (!Number.isFinite(target) || target <= 0) return [];
+  const ids = [];
+  for (const event of list) {
+    if (event === null || typeof event !== 'object') continue;
+    if (event.type !== 'assistant/message') continue;
+    if (Number(event.data?.turn) !== target) continue;
+    const id = event.data?.message?.id;
+    if (typeof id === 'string' && id !== '') ids.push(id);
+  }
+  return ids;
+}
+
+/**
  * 只读地取会话的事件快照。
  *
  * `snapshotEvents` 是宿主给的方法，**可能不存在**（替身 / 老版本）；取不到就当"没有事件"，
@@ -98,12 +127,12 @@ export function eventsOf(session) {
 /**
  * 造一个自动搬运器。
  *
- * `observe(session, event)` 返回**判定结果字符串**（`sent` / `in-flight` / `no-chat` /
+ * `observe(session, event)` 返回**判定结果字符串**（`sent` / `in-flight` / `pumped` / `no-chat` /
  * `empty` / `quiet` / `tool-sent` / `send-failed` / `error`），测试直接断言它，
  * 不必去猜日志。
  *
  * @param {object} options
- * @param {any} options.gateway 网关（要 `chatOf` / `isTurnInFlight` / `sendTurnReply`）
+ * @param {any} options.gateway 网关（要 `chatOf` / `isTurnInFlight(sessionKey, turn)` / `sendTurnReply`）
  * @param {(level: string, message: string, meta?: object) => void} [options.log]
  * @param {(text: string) => boolean} [options.isQuiet] `[不说话]` 判定（默认与网关口一致）
  * @param {readonly string[]} [options.toolNames] 见 `TEXT_SEND_TOOL_NAMES`
@@ -119,6 +148,8 @@ export function createAutoRelay({ gateway, log = () => {}, isQuiet = isQuietMark
     sent: 0,
     /** 让路给 `runTurn`（含定时唤醒 / 内部通道）的轮数 */
     skippedInFlight: 0,
+    /** 这一轮的助手文本已经由逐段泵接手过（按消息 id 判）的轮数 */
+    skippedPumped: 0,
     /** 这个会话映射不到 QQ chatId（= 不是 QQ 会话） */
     skippedNoTarget: 0,
     /** 这一轮没有助手正文 */
@@ -156,12 +187,38 @@ export function createAutoRelay({ gateway, log = () => {}, isQuiet = isQuietMark
         return 'no-session';
       }
 
+      // 事件快照先读一次：下面几条判据都要用（读不到 = 空数组，`eventsOf` 自己吞异常）。
+      const events = eventsOf(session);
+
       // ① 这一轮是**插件自己驱动的**（QQ 入站 / 内部通道 / 定时唤醒）⇒ 让路。
       //    `runTurn` 自己会发，而且它那条路有 `silent` / `send_qq` / `[不说话]` 三套判据。
-      if (typeof gateway?.isTurnInFlight === 'function' && gateway.isTurnInFlight(sessionId) === true) {
+      //
+      // ⚠️ **必须把轮号一起传下去**（2026-11-16）：网关那边"在飞"的牌子是按**会话**举的，
+      // 而插件的一轮可能先占住会话、提示词还在队里 —— 「她自己的时间」就是这样举着牌子
+      // 等了 75 秒，正好盖住宿主自己在同一个会话里跑的 turn 2746（`subagent-settled`
+      // 唤醒，683 字、4 个 `⟨cut⟩`），于是那一轮**两边都不认领**：这里让路，逐段泵又不认。
+      // 传了轮号之后网关只会为**同一个 turn** 让路（见 `isTurnInFlight`）。
+      if (typeof gateway?.isTurnInFlight === 'function' && gateway.isTurnInFlight(sessionId, turn) === true) {
         stats.skippedInFlight += 1;
         note('in-flight');
         return 'in-flight';
+      }
+
+      // ①-b 这一轮的助手文本**已经被逐段泵接手过**⇒ 同样让路（2026-11-16，防"多段轮发两遍"）。
+      //
+      // 为什么 ① 不够：泵认轮号靠 `turn/start`，万一认不出来（宿主没给事件 / 事件缺项），
+      // ① 就放行，于是这里发**整串** `said.join('\n')`，而泵在轮末还会把**每一段**再发一遍。
+      // `#sendOne` 的「同文短窗」要求正文**完全相同**才拦 —— 整串 ≠ 单段，挡不住。
+      //
+      // 这里按**消息 id** 判（唯一、顺序无关）：只要这一轮任意一段已被泵接手，整轮归泵，
+      // 没发的那几段由泵 `stop()` 的最后一次扫描补上（那正是它的职责）。
+      if (typeof gateway?.turnHandedToPump === 'function') {
+        const ids = assistantMessageIdsOfTurn(events, turn);
+        if (ids.length > 0 && gateway.turnHandedToPump(sessionId, ids) === true) {
+          stats.skippedPumped += 1;
+          note('pumped');
+          return 'pumped';
+        }
       }
 
       // ② 这个会话得有 QQ 出口 —— 认不出 chatId 就是"不是 QQ 会话"（主会话、子会话等）。
@@ -173,9 +230,11 @@ export function createAutoRelay({ gateway, log = () => {}, isQuiet = isQuietMark
         return 'no-chat';
       }
 
-      const events = eventsOf(session);
-
-      // ③ 正文：**这一轮**的最后一段助手文本（按 `data.turn` 取，抗压缩）。
+      // ③ 正文：**这一轮的全部**助手文本（拼接，静默标记的段自动跳过）。
+      //
+      // ⚠️ 2026-11-14 改：原来只取"最后一条助手文本"，于是"先说一大段、末尾补一句
+      // `[不说话]`"的轮次被判成静默 ⇒ **整轮内容丢掉**（用户连报两次"吞发言"）。
+      // `[不说话]` 的语义是"这一轮不出声"，不是"把前面说的作废"。
       //
       // ⚠️ 先分清"宿主没给事件快照"和"这一轮确实没说话"——两者在旧实现里长得一模一样
       // （都是"没东西可发"），那是最难查的一类静默失败。没有 `snapshotEvents` 这个方法

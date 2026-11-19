@@ -24,6 +24,9 @@ import { flattenPrecheck, formatStamp, renderEntries, replaceImagePlaceholders }
 import { DEFAULT_MAX_IMAGES, STICKER_DESC_CHARS, imageKey } from './image-desc.mjs';
 import { stripMarkdown } from '../onebot/plain-text.mjs';
 import { LAYER_GW_SEND, LAYER_TRANSPORT_ACTION, ledgerHash } from './outbound-ledger.mjs';
+// 2026-11-18：出站文本判据（实验性观测）。**只借 `textHead` 和层标记**，
+// 真正的调用逻辑在本文件的 `#lintOutbound` 里（判断"什么时候跳"是网关的事）。
+import { LAYER_TEXT_LINT, textHead } from './text-lint.mjs';
 import { DEFAULT_PROMPT_CONFIG } from './prompt-config.mjs';
 
 /** 一条入站消息的处理结果，用于日志与测试断言。 */
@@ -379,6 +382,19 @@ export class Gateway {
     // 为 null 时一个名字都不查、也不学（@ 段落回退成 `@QQ号`）—— 它**绝不是必需品**，
     // 和 `stickerLibrary` / `outboundLedger` 同一条规矩。
     nicknames = null,
+    // **出站文本判据**（`text-lint.mjs` 的 `createTextLinter(...)` 产物，2026-11-18 加）。
+    //
+    // 它只做一件事：把"已经定稿、马上要发"的那段文字**事后**过一遍词表判据，
+    // 往出站台账补记一行 `text-lint`。**不改文本、不拦截、不给用户提示。**
+    //
+    // 🔴 三条铁律（破坏任何一条都会让发送链路变差）：
+    //   1. **绝不 await 在发送路径上** —— 它慢了/挂了，消息就晚发了。
+    //   2. **任何失败静默降级** —— 服务没起 / 超时 / 500 ⇒ 台账少一行，别的一律照旧。
+    //   3. **回调自己吞异常** —— 它跑在宿主进程里，抛出去 = 宿主退出。
+    //
+    // 为 null 时一行都不记（没有判据的环境照样收、照样回）—— 它**绝不是必需品**，
+    // 和 `stickerLibrary` / `outboundLedger` 同一条规矩。
+    textLint = null,
     // ===== 「说不说」的裁量模式（2026-10-13 落地模式 2/3）=====
     //
     // ⚠️ **网关不持有判定逻辑**，只持有两个"过了闸门之后"的零件：
@@ -627,6 +643,38 @@ export class Gateway {
      */
     this.turnsInFlight = new Set();
     /**
+     * **`runTurn` 自己那一轮是第几轮**（会话键 → turn 号，2026-11-16）。
+     *
+     * `turnsInFlight` 只回答"这个会话现在有没有插件自己驱动的轮次在跑"，它是**按会话**的。
+     * 拿它当"这一轮归谁发"的判据会漏话：插件的一轮可能**先占住会话、把提示词排在队里**
+     * （典型是「她自己的时间」/ 内部通道），与此同时宿主自己跑的另一轮（子会话交活、
+     * 后台作业结束）正在同一个会话里说话 —— 那个会话级的牌子会让自动搬运把**别人的轮次**
+     * 也当成"插件会自己发"而让路，于是那 683 字两边都不认领（2026-11-16 turn 2746）。
+     *
+     * ⇒ 归谁发要**按轮**判：`runTurn` 认出自己这一轮的 turn 号后登记在这里
+     * （`noteTurnOwner`），`isTurnInFlight(key, turn)` 只在**同一个 turn** 上返回 true。
+     * 没登记（比如提示词还在排队、这一轮还没开始）⇒ 不算"在飞"，调用方照常发。
+     * @type {Map<string, number>}
+     */
+    this.turnOwners = new Map();
+    /**
+     * **逐段泵已经认领过的助手消息 id**（会话键 → `[{id, at}]`，2026-11-16）。
+     *
+     * 和 `turnOwners` 是一对**互相独立的**保险，回答同一个问题"这一轮归谁发"：
+     *
+     * - `turnOwners` 按**轮号**判 —— 精确、便宜，但要求事件里有 `turn/start`
+     *   （宿主没给事件 / 事件缺项时认不出轮号）；
+     * - 这张表按**消息 id**判 —— 只要这一轮的助手段里**有任何一段**已经交给逐段泵
+     *   （哪怕泵最后判了"不发"，比如静默轮），整轮就归泵，自动搬运不再搬整串。
+     *
+     * 为什么需要第二条（2026-11-16）：`auto-relay` 发的是**整串** `said.join('\n')`，
+     * 而泵是**逐段**发（`runTurn-step1-part1..4`）—— 整串 ≠ 单段，`#sendOne` 的
+     * 「同文短窗」要求正文完全相同才拦，**挡不住**多段轮发两遍。认轮号那条路万一失手，
+     * 这条按 id 的还能兜住，而且它是**顺序无关**的（id 唯一，不会误判到别的轮次）。
+     * @type {Map<string, Array<{id: string, at: number}>>}
+     */
+    this.pumpedIds = new Map();
+    /**
      * **最近一条语音段（`record`）的字段摘要**（B4 探针，2026-10-25）→ 进调试快照。
      * `null` = 进程起来之后还没收到过语音。见 `#logRecordSegments`。
      * @type {null | {at: string, chatId: string, count: number, transcribed: boolean, records: object[]}}
@@ -699,6 +747,12 @@ export class Gateway {
      * 为 null ⇒ 两个方向都不做，@ 段退回 `@QQ号`。
      */
     this.nicknames = nicknames;
+    /**
+     * **出站文本判据**（可为 null）。见构造函数里 `textLint` 那段的三条铁律。
+     *
+     * 每次 `#sendOne` 之后 fire-and-forget 调一次，**结果异步回来再补记台账**。
+     */
+    this.textLint = textLint;
     /**
      * 「说不说」的裁量模式（`heuristic` / `precheck` / `inTurn`）。
      * ⚠️ 归一化在 `judge-mode.mjs` 的 `normalizeJudgeMode()` 里做，
@@ -800,6 +854,19 @@ export class Gateway {
      * @type {((message: object) => unknown)|null}
      */
     this.onUserMessage = null;
+    /**
+     * 「她自己刚发出去一条」的观察者（2026-11-18 加，可为 `null`）。
+     *
+     * 为什么需要它：短追问的计时基准是 `max(用户最后一条入站, 她自己最后一条出站)`，
+     * 而「她刚说了话」只有**发送成功之后**才知道 ⇒ 由 `#sendOne` 转告一次。
+     *
+     * 口径（与 `onUserMessage` 对称）：
+     * - **只报真的发出去了的**（`transport.sendToChat` 成功之后；失败 / 同文短窗拦下不报）；
+     * - **不判断会话算不算数**（私聊？群？）—— 那是调用方（`free-time.mjs`）的事；
+     * - 回调体抛异常**不能冒到发送链上** ⇒ 这里自己 try/catch（`#noteSelfOutbound`）。
+     * @type {((message: {chatId: string, at: number}) => unknown)|null}
+     */
+    this.onSelfMessage = null;
     /**
      * 统计，给诊断用。
      *
@@ -1814,9 +1881,13 @@ export class Gateway {
         if (String(mid) === id) return entry;
       }
     }
-    // 转录里没有 ⇒ 查 `get_msg` 那一层的结果（见 `#primeQuoted`）。
-    // 顺序刻意是"转录优先"：绝大多数引用在转录里（同步、零调用），
-    // 缓存只服务"小鲸鱼自己发的 / 已被挤出窗口的"那两种。
+    // 转录里没有 ⇒ **先查本地聊天记录**（2026-11-18）：同步、零调用，
+    // 覆盖"已被挤出 60 条窗口"与"跨重启"这两种 AI 之外都拿不到的原文。
+    const logged = this.engine?.findChatLogMessage?.(message?.chatId, id);
+    if (logged !== null && logged !== undefined) return logged;
+    // 还是查不到 ⇒ 查 `get_msg` 那一层的结果（见 `#primeQuoted`）。
+    // 顺序刻意是"转录 → 本地记录 → 网络"：绝大多数引用在前两者里（同步、零调用），
+    // 缓存只服务"两边都没有的"那一种。
     return this.#quoteCacheGet(id) ?? null;
   }
 
@@ -2651,9 +2722,13 @@ export class Gateway {
       lastText: '',
     };
 
-    const onSegment = async (text, step) => {
+    const onSegment = async (text, step, meta = null) => {
       try {
         const body = String(text ?? '').trim();
+        // ⓪ **先登记"这一段归泵了"**（2026-11-16）：位置必须在所有"不发"分支**之前**。
+        //    语义是"泵接手了这一轮"，不是"发出去了"——静默轮 / `[不说话]` 那几段确实不该发，
+        //    但自动搬运也不许再把同一轮整串搬一遍（自动搬运见 `turnHandedToPump`）。
+        this.notePumpedMessage(sessionKey, meta?.id);
         if (body === '') return;
         const label = Number.isFinite(Number(step)) && Number(step) > 0 ? Number(step) : segments.attempted + 1;
         // ① `[不说话]` 是**标记**，永远不出去（与下面整轮那条分支同一口径）。
@@ -2721,10 +2796,18 @@ export class Gateway {
         // 逐段外发的回调（binder 每写出一个 step 调一次）。不认识它的 responder
         // （替身 / 老实现）会直接忽略 —— 那条路退回"轮末整段发一次"。
         onSegment,
+        // **「这一轮归我」的登记口**（2026-11-16）：binder 认出自己这一轮的 turn 号后
+        // 调一次，网关记进 `turnOwners` ⇒ `isTurnInFlight(key, turn)` 才能**按轮**判。
+        // 同样是不认识的 responder 直接忽略（那条路没有逐段泵，也就没有登记）。
+        // 走回调而不是让 binder 直接持有网关：绑定层至今不认识网关对象（`onSegment` 同理）。
+        onTurn: (turn) => this.noteTurnOwner(sessionKey, turn),
       });
     } finally {
       // `turn/end` 就发生在上面那次 await 里，所以这里删掉不会影响本轮判定。
       this.turnsInFlight.delete(sessionKey);
+      // 轮归属同生共死（2026-11-16）：留着的话，下一轮宿主自己跑的轮次万一撞上同一个号
+      // （重开会话 / 日志回放）就会被误判成"这一轮插件会自己发" ⇒ 静默吞话。
+      this.clearTurnOwner(sessionKey);
     }
 
     const toolSentThisTurn = (this.toolSendSeq.get(sessionKey) ?? 0) > toolSendSeqBefore;
@@ -3164,12 +3247,146 @@ export class Gateway {
    *
    * 自动搬运（`dsh/auto-relay.mjs`）用它给 `runTurn` 让路 —— 见 `turnsInFlight` 的说明。
    *
+   * ⚠️ **传了 `turn` 就按轮判（2026-11-16）**：只看"这个会话现在有插件轮次在跑"会把
+   * **宿主自己跑的轮次**也一起挡掉（`turnsInFlight` 是按会话的，而插件那一轮可能还没轮到、
+   * 正排在队里 —— 见 `turnOwners` 的说明）。所以：
+   *
+   * - `turn` 是**正数** ⇒ 只有"这一轮就是我登记过的那一轮"才 `true`；
+   * - 不传 / 传 0 / 非法值 ⇒ **保持旧口径**（按会话判），老调用点行为逐字节不变。
+   *
    * @param {unknown} sessionKey
+   * @param {unknown} [turn] `turn/end` 的 `data.turn`（不传 = 旧行为）
    * @returns {boolean}
    */
-  isTurnInFlight(sessionKey) {
+  isTurnInFlight(sessionKey, turn) {
     try {
-      return this.turnsInFlight.has(String(sessionKey ?? ''));
+      const key = String(sessionKey ?? '');
+      const want = Number(turn);
+      if (!Number.isFinite(want) || want <= 0) {
+        // 旧口径：这个会话上有没有插件自己驱动的轮次（向后兼容，别让老调用点炸）。
+        return this.turnsInFlight.has(key);
+      }
+      return this.turnOwners.get(key) === want;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * **登记「这一轮归我发」**（2026-11-16，`runTurn` 认出自己的 turn 号后调一次）。
+   *
+   * 由绑定层（`binding.mjs` 的逐段泵）在「本轮提示词已经被宿主收下、对应的 turn 起来了」
+   * 那一刻调 —— 也就是 `turn/end` **之前**，所以自动搬运在那个 `turn/end` 上一定看得到它。
+   *
+   * 语义边界：
+   * - 只记**一个**轮号（同一个会话里后登记的覆盖前一个），因为 `runTurn` 是按会话串行的；
+   * - 轮号非法（0 / 负数 / NaN）⇒ 忽略，**不登记**（宁可让自动搬运去发，也不能凭空吞话）；
+   * - 绝不抛：调用方是挂在轮次热路径上的回调。
+   *
+   * @param {unknown} sessionKey
+   * @param {unknown} turn
+   * @returns {boolean} 登记上了没有
+   */
+  noteTurnOwner(sessionKey, turn) {
+    try {
+      const key = String(sessionKey ?? '');
+      const n = Number(turn);
+      if (key === '' || !Number.isFinite(n) || n <= 0) return false;
+      this.turnOwners.set(key, n);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 撤掉登记（`runTurn` 收尾时调）。只撤**自己那一轮**：传了 `turn` 且与当前登记不符
+   * 就什么都不做 —— 免得把后一轮的登记擦掉（网关按会话串行，正常情况下不会重叠，
+   * 但库里没有"必须重叠才能出错"的保证）。
+   *
+   * @param {unknown} sessionKey
+   * @param {unknown} [turn]
+   * @returns {boolean} 真的撤掉了没有
+   */
+  clearTurnOwner(sessionKey, turn) {
+    try {
+      const key = String(sessionKey ?? '');
+      const have = this.turnOwners.get(key);
+      if (have === undefined) return false;
+      const want = Number(turn);
+      if (Number.isFinite(want) && want > 0 && have !== want) return false;
+      this.turnOwners.delete(key);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 这个会话当前登记的"我这一轮"是第几轮（`0` = 没登记）。
+   * 只给调试快照 / 测试看，不参与发送决策。
+   *
+   * @param {unknown} sessionKey
+   * @returns {number}
+   */
+  turnOwnerOf(sessionKey) {
+    try {
+      return Number(this.turnOwners.get(String(sessionKey ?? ''))) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * **登记「这一段归逐段泵了」**（2026-11-16）。
+   *
+   * 由 `runTurn` 的 `onSegment` 在**判"发不发"之前**调 —— 语义是"这一轮的这一段已经由
+   * 泵接手"，不是"发出去了"：静默轮 / `[不说话]` / 工具已发过那几段确实不该发，
+   * 但它们同样**不该再由自动搬运搬一遍**（否则「她自己的时间」的自言自语会飞上手机）。
+   *
+   * @param {unknown} sessionKey
+   * @param {unknown} messageId 助手消息 id（空串 = 忽略）
+   * @returns {boolean}
+   */
+  notePumpedMessage(sessionKey, messageId) {
+    try {
+      const key = String(sessionKey ?? '');
+      const id = String(messageId ?? '');
+      if (key === '' || id === '') return false;
+      const list = this.pumpedIds.get(key) ?? [];
+      if (list.some((entry) => entry.id === id)) return false;
+      list.push({ id, at: typeof this.engine?.now === 'function' ? this.engine.now() : Date.now() });
+      // 只需要挡住"刚结束的这一轮"：留最近 200 条足够，别让长会话无限涨（OOM 是老账）。
+      if (list.length > 200) list.splice(0, list.length - 200);
+      this.pumpedIds.set(key, list);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 这一轮的助手消息里**有没有已经被逐段泵接手过的**（`auto-relay` 用它防重复）。
+   *
+   * 任一命中即算：泵是逐段发的，只要它已经动了这一轮的任意一段，整轮就归它；
+   * 剩下没发出的那几段，泵在 `stop()` 的最后一次扫描里会补上。
+   *
+   * @param {unknown} sessionKey
+   * @param {Iterable<string>|Array<string>} messageIds 这一轮的助手消息 id
+   * @returns {boolean}
+   */
+  turnHandedToPump(sessionKey, messageIds) {
+    try {
+      const key = String(sessionKey ?? '');
+      const list = this.pumpedIds.get(key);
+      if (key === '' || !Array.isArray(list) || list.length === 0) return false;
+      const want = messageIds instanceof Set ? [...messageIds] : Array.isArray(messageIds) ? messageIds : [];
+      if (want.length === 0) return false;
+      const have = new Set(list.map((entry) => entry.id));
+      for (const id of want) {
+        if (typeof id === 'string' && id !== '' && have.has(id)) return true;
+      }
+      return false;
     } catch {
       return false;
     }
@@ -3968,13 +4185,51 @@ export class Gateway {
     // ⚠️ 所以这一行**拿不到 `messageId`** —— 那是 NapCat 回了才有的东西。
     //    `messageId` 记在下面 `transport-action` 那一层（那里才真有）。
     //    `ok` 的口径见 `#recordOutbound` 的注释（**不是**"NapCat 收下了"）。
+    // 时刻取一次、两行共用：`text-lint` 那行的 `at` 必须与本行**逐字节一致**，
+    // 否则"按时间关联"就退化成"按时间猜"。
+    const sentAt = new Date().toISOString();
     this.#recordOutbound(LAYER_GW_SEND, {
-      chatId, caller, text: plain, at: new Date().toISOString(), ok: true, images: sources.length, kind,
+      chatId, caller, text: plain, at: sentAt, ok: true, images: sources.length, kind,
     });
+    if (sources.length === 0) {
+      // 文本判据（2026-11-18）：**fire-and-forget，绝不 await**。
+      // 只对"纯文本"跑 —— 带图那几条的主体是图，判文本没有意义。
+      this.#lintOutbound(plain, { chatId, caller, at: sentAt });
+    }
     const payload = outboundMessage(plain, sources);
     // 发送失败由 `transport-action` 那一层记（`ok:false`）—— 这里**不重复记**，
     // 否则一次发送会在 `gw-send` 上留两行，计数就不再是"要发几次"了。
-    const result = await this.transport.sendToChat(chatId, payload);
+    //
+    // ⚠️ 2026-11-18：**`throw` 行为一个字节都没改** —— 这里 catch 里只多一条
+    // "失败行落盘"（`delivered:false`，只供人工排查、回灌时一律过滤），
+    // 然后**把同一个异常原样抛出去**。不要在这里改返回值、也不要吞掉它。
+    let result;
+    try {
+      result = await this.transport.sendToChat(chatId, payload);
+    } catch (error) {
+      this.#noteSendFailure(chatId, plain, { error, kind, images: sources.length });
+      throw error;
+    }
+    // ===== 转录留痕（2026-11-10）：她刚发出去的这句也写进转录 =====
+    //
+    // 位置刻意放在**这里**（`#sendOne` = "一段真的交给传输层"，发送成功之后）：
+    //   · 所有出站路径都收敛到本方法 —— `send_qq`、轮次正文自动发送、
+    //     `⟨cut⟩` 切分后的**每一段**（`#send` 的循环每段一次）、auto-relay 搬运；
+    //   · 切 3 段就写 3 条（对方确实看到 3 条），而同一段只会写一次
+    //     （一次 `#sendOne` = 一段）；
+    //   · 【发送失败】根本走不到这行（`transport.sendToChat` 失败是抛异常），
+    //     【空正文】与【`[不说话]`】由下面那个方法自己挡掉。
+    // ⚠️ 它**只记录**：不改载荷、不重试、不影响返回值（内部自己 try/catch）。
+    //
+    // 2026-11-18：把 `result`（= NapCat 的 `message_id`）传下去 —— 那正是
+    // 引用回查按 id 找"她自己说过的话"时缺的那一半（见 `#noteSelfTranscript`）。
+    this.#noteSelfTranscript(chatId, plain, kind, result, sources.length);
+    // ===== 「她自己刚发出去一条」的观察者（2026-11-18）=====
+    //
+    // 位置：**发送成功之后、所有出站路径的汇合点**（同 `#noteSelfTranscript` 的理由）。
+    // 它只服务一件事：把短追问的计时基准推后（`free-time.mjs` 的 `noteSelfMessage`）。
+    // 空正文 / 纯表情包那一条**也算一次出站**（对方确实看到了），所以这里不按正文过滤。
+    this.#noteSelfOutbound(chatId);
     // 记账放在**发成功之后**：发失败却加了一次使用次数，会让"挑"的依据变假。
     for (const md5 of usedStickers) {
       try {
@@ -3984,6 +4239,119 @@ export class Gateway {
       }
     }
     return result;
+  }
+
+  /**
+   * 把**刚发出去的那一段**追加进该会话的转录（2026-11-10）。
+   *
+   * 只写"她自己说的这句话"：`fromSelf: true` ⇒ 转录渲染成 `[HH:MM] 我(小鲸鱼): 正文`。
+   * 群聊/私聊同一条路（`chatId` 自己带 `private:` / `group:` 前缀，引擎按它填 `kind`）。
+   *
+   * ## 三条硬约束
+   *
+   * 1. **绝不抛** —— 这是挂在发送路径**之后**的一步记录：转录写不进去（引擎没接上、
+   *    缓冲区坏了、注入的是 null）也只是少一条上下文，那条消息该发还是发。
+   * 2. **空正文不写**（纯图 / 纯表情包那一条 `plain === ''`）—— 一行"我说了空话"
+   *    只会污染转录。
+   * 3. **`[不说话]` 不写** —— 那是"这一轮我不出声"，它不是发言（口径同 `isQuietMark`，
+   *    与 `runTurn` / auto-relay 的静默判定逐字一致）。
+   *
+   * @param {string} chatId
+   * @param {string} text 真的到 QQ 上的那段正文（已剥 Markdown）
+   * @param {string} [kind] 台账口径（`text` / `image`），**不参与**这里任何判断
+   * @param {unknown} [messageId] 传输层回来的 `message_id`（`sendToChat` 的返回值）。
+   *   拿不到就传 `undefined` —— **不编**（编一个假 id 会让引用回查指到别人的消息上）。
+   * @param {number} [images] 这段带了几张图（只用于 `wire` 段类型序列）
+   * @returns {boolean} 写进去了没有
+   * @private
+   */
+  #noteSelfTranscript(chatId, text, kind = 'text', messageId = undefined, images = 0) {
+    try {
+      const body = String(text ?? '').trim();
+      if (body === '' || isQuietMark(body)) return false;
+      const engine = this.engine;
+      if (engine === null || engine === undefined || typeof engine.noteSelfMessage !== 'function') return false;
+      const at = typeof engine.now === 'function' ? engine.now() : Date.now();
+      const wire = Number.isFinite(images) && images > 0
+        ? ['text', ...new Array(Math.floor(images)).fill('image')].join(',')
+        : 'text';
+      // ⚠️ 引擎内部是"**内存先、磁盘后**"：转录写不进去不影响磁盘那行，
+      //    磁盘写不进去也绝不冒到这条发送链上（`noteSelfMessage` 自己吞）。
+      return engine.noteSelfMessage(chatId, body, at, { messageId, wire }) === true;
+    } catch (error) {
+      this.log('warn', '转录留痕失败（这条消息已经发出去了，不受影响）', {
+        chatId,
+        kind,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * 把「她刚发出去一条」这件事转告给观察者（`onSelfMessage`，2026-11-18）。
+   *
+   * 唯一用途：`free-time.mjs` 据此把**短追问的计时基准**推到"她最后说的那句"上
+   * （基准 = `max(用户最后一条入站, 她最后一条出站)`，见那边的模块注释）。
+   *
+   * **永不抛** —— 它挂在发送成功之后：抛出去会把一条已经发出去的消息变成"发送失败"，
+   * 那正是最不该出现的结果。调用方没接（`null`）或回调体自己炸了，都只降级成一条 debug。
+   *
+   * @param {string} chatId
+   * @returns {boolean}
+   * @private
+   */
+  #noteSelfOutbound(chatId) {
+    if (typeof this.onSelfMessage !== 'function') return false;
+    try {
+      const at = typeof this.engine?.now === 'function' ? this.engine.now() : Date.now();
+      return this.onSelfMessage({ chatId: String(chatId ?? ''), at }) === true;
+    } catch (error) {
+      this.log('debug', '自己发言的锚点记录失败（忽略，消息已经发出去了）', {
+        chatId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * **发送失败的落盘**（2026-11-18）：只落一条 `delivered:false` + `error` 供人工排查。
+   *
+   * 三条规矩（每一条都是为了不把排查变成新的故障）：
+   * 1. **绝不抛**：它在 `#sendOne` 的 `catch` 里，抛出去会把原始异常换成这条记录的异常
+   *    （而那条原始异常正是要往上冒的东西）。所以内部自己 try/catch。
+   * 2. **改成"说没说"由 `delivered` 表达，不进内存**：失败的那句话**永远不进转录/提示词**
+   *    （过滤在 `chat-log.mjs` 的 `isReplayable`）—— 否则她会以为自己说过了，
+   *    从此不再提，比不知道更糟。
+   * 3. **`[不说话]` / 空正文不落**：那不是一个"发失败的话"，是"这一轮本来就不出声"。
+   *
+   * @param {string} chatId
+   * @param {string} text
+   * @param {{error?: unknown, kind?: string, images?: number}} [extra]
+   * @returns {boolean}
+   * @private
+   */
+  #noteSendFailure(chatId, text, extra = {}) {
+    try {
+      const body = String(text ?? '').trim();
+      if (body === '' || isQuietMark(body)) return false;
+      const engine = this.engine;
+      if (engine === null || engine === undefined || typeof engine.noteFailedSend !== 'function') return false;
+      const at = typeof engine.now === 'function' ? engine.now() : Date.now();
+      const images = Number(extra?.images);
+      const wire = Number.isFinite(images) && images > 0
+        ? ['text', ...new Array(Math.floor(images)).fill('image')].join(',')
+        : 'text';
+      return engine.noteFailedSend(chatId, body, at, { error: extra?.error, wire }) === true;
+    } catch (error) {
+      this.log('warn', '发送失败留痕失败（忽略，异常照原样往上抛）', {
+        chatId,
+        kind: extra?.kind ?? 'text',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 
   /**
@@ -4041,6 +4409,10 @@ export class Gateway {
         chatId: input.chatId,
         chars: input.text.length,
         sha256: ledgerHash(input.text),
+        // 2026-11-18：净文本**前 200 字**（台账 `text` 字段；全文永远不进台账）。
+        // 两个层都记 ⇒ 拿 `gw-send` 和 `transport-action` 两行的 `text` 一比，
+        // 就能分清"我采样错了"还是"传输层改写了"（这正是加这个字段的理由）。
+        textHead: input.text,
         ok: input.ok,
         messageId: input.messageId,
         meta: {
@@ -4061,6 +4433,77 @@ export class Gateway {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /**
+   * **出站文本判据**（2026-11-18，实验性观测）：把已定稿的文本事后过一遍词表判据，
+   * 异步回来再往台账补一行 `text-lint`。
+   *
+   * ## 为什么是 fire-and-forget，而不是 await 后再发
+   *
+   * 用户的要求原话是「**超时不阻塞**」「这个判据绝不能成为发送链路的单点故障」。
+   * 那就只有一种做法：**调用方不拿它的结果做任何决定**。所以这里连 `await` 都没有，
+   * 整个链是 `Promise.resolve().then(...).then(...).catch(...)`。
+   *
+   * 代价是：台账里 `text-lint` 这一行**永远晚于**同一条 `gw-send` 行（异步），
+   * 而且服务挂掉时**那一行根本不存在**。这两种情况在统计时都必须当成
+   * 「这条消息**没有判据结果**」，不能当成「没有可疑位置」——
+   * 所以 `svc` 字段是必须的，`count: 0` 单独看会骗人。
+   *
+   * ## 为什么单独一行，而不是塞进 `gw-send` 那一行
+   *
+   * 台账是**只追加**的，`gw-send` 那一行在"决定要发"的瞬间就写下去了，
+   * 那时判据结果还没回来。要合并就得阻塞发送（违反第一条）。
+   * ⇒ 只能两行，靠 `sha256` + `chatId` + 相同的 `at` 关联
+   * （`at` 由调用方传进来，两行**逐字节相同**）。
+   *
+   * @param {string} text 已定稿的净文本
+   * @param {{chatId: string, caller: string, at: string}} ref 关联键（`at` 来自 `gw-send` 那一行）
+   * @returns {void}
+   */
+  #lintOutbound(text, ref) {
+    const linter = this.textLint;
+    if (linter === null || typeof linter.inspect !== 'function') return;
+    const plain = String(text ?? '');
+    if (plain === '') return;
+    const { chatId = '', caller = 'unknown', at = new Date().toISOString() } = ref ?? {};
+    // ⚠️ `ledgerHash` 只算一次、两行共用 —— 它就是关联键，算两遍迟早会漂移
+    //    （这里算的是**同一个字符串**，所以其实不会漂，但共用更诚实）。
+    const sha = ledgerHash(plain);
+    // 🔴 整条链**自己吞掉所有异常**：它跑在宿主进程里，抛出去 = 宿主退出。
+    Promise.resolve()
+      .then(() => linter.inspect(plain))
+      .then((result) => {
+        const ledger = this.outboundLedger;
+        if (ledger === null || typeof ledger.record !== 'function') return;
+        const r = result !== null && typeof result === 'object' ? result : {};
+        ledger.record({
+          at,
+          layer: LAYER_TEXT_LINT,
+          caller: `${caller}:lint`,
+          chatId,
+          chars: plain.length,
+          sha256: sha,
+          // ⚠️ 在这一层，`ok` 的含义是「**判据服务正常答复了**」，
+          //    **不是**「消息发成功了」—— 发送成败只看 `gw-send` / `transport-action`。
+          //    判读表的三个形状不受影响（它只数那两个层）。
+          ok: r.svc === 'ok',
+          lint: {
+            count: Number(r.count) || 0,
+            ms: Number(r.ms) || 0,
+            svc: typeof r.svc === 'string' ? r.svc : 'unknown',
+            samples: Array.isArray(r.samples) ? r.samples : [],
+          },
+        });
+      })
+      .catch((error) => {
+        // 连补记台账都失败了 —— 只留一条 debug，**绝不再往上抛**。
+        try {
+          this.log('debug', '文本判据补记台账失败（发送不受影响）', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch { /* 日志本身坏了也不能抛 */ }
+      });
   }
 
   /**

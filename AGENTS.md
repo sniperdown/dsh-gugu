@@ -13,8 +13,13 @@ npm run test:isolated   # 逐文件独立进程（node --test + glob），非沙
 - **别用裸 `node --test`**：受限沙箱禁 named pipe，子进程抓管道会 `EPERM`，
   表现是"每个文件正好 1 条失败"的假红。
 - `npm test` 自己 readdir 扫 `test/*.test.mjs`，**新增测试文件自动跑到**，不用维护清单。
-- 基线：**104 个文件 / 2221 条**。当前已知长期红 1 条
-  （`markdown-outbound` 的「图片段一个字节都不碰」）；除它以外应当全绿。
+- 基线：**114 个文件 / 2411 条**。当前已知长期红 3 条，都是**环境/部署相关**、
+  与改动无关，别当成自己弄坏的：
+  - `markdown-outbound` 的「图片段一个字节都不碰」；
+  - `persona-rules` 的「五段硬规矩必须真的在人格里」（要一份真机的 `qq-gugu.toml`）；
+  - `group-names` 的「`defaultGroupNameTablePath` 没有 DSH_HOME ⇒ 本部署写死目录」
+    （钉的是某次部署的实际路径）。
+  除这三条以外应当全绿。
 - 判绿：**条数对得上基线且退出码为 0**。
 
 ## 二、改完代码 / 配置，它真的生效了吗
@@ -86,12 +91,12 @@ src/dsh/paths.mjs          插件文件路径的统一解析
 web/ + client.js           设置页（浏览器半 / 宿主半），零构建
 tools/                     开发与诊断脚本（bootstrap 体检、健康检查、回放…）
 docs/                      设计与部署文档
-test/                      测试（104 个文件）
+test/                      测试（114 个文件）
 ```
 
 ## 八、提交前
 
-- `npm test` 绿（除已知那条）。
+- `npm test` 绿（除上面那三条已知红）。
 - **别把运行期产物带进提交**：`.gitignore` 里逐条写了理由；尤其注意
   `test/.tmp-*/`（测试会往里写抓下来的图片）与真实 `qq-gugu.toml`。
 - 新增配置字段要同时改：`src/dsh/config-fields.mjs`（设置页）、

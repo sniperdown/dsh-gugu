@@ -41,10 +41,22 @@
  * （于是再也看不见"发了两遍"），重试会**制造**第二条（于是台账里多一条，
  * 而分不清是它造的、还是本来就有的）。**先把口径补上，再谈修。**
  *
- * ## 隐私：**绝不记消息原文**
+ * ## 隐私：**只记前 200 个字，不记全文**（2026-11-18 改，之前是"一个字都不记"）
  *
- * 只记长度（`chars`）+ 哈希（`sha256` 前 16 位）。哈希是**判据**：
- * 同一秒出现两条相同的 `sha256` ⇒ 真的发了两遍。QQ 号/会话 id 不算正文，照记。
+ * 原来这里写着「**绝不记消息原文**」，只记 `chars` + `sha256`。那个口径有一个具体缺口：
+ * 台账能证明"同一条文本发了两次"，但**分不清"我采样错了"还是"传输层改写了"**
+ * ——这两件事在只有哈希的时候长得一模一样（哈希不同就不一样，可哈希不同时
+ * 恰恰看不出**哪里**被改了）。用户批准后补上 `text` 字段：
+ *
+ * | 字段 | 内容 | 为什么够 |
+ * |---|---|---|
+ * | `chars` | **总长度**（这个一直是有的） | 完整性判据不依赖原文 |
+ * | `text` | 净文本的**前 200 个字** | 够看出"开头是不是被改写了"，不够泄露一整段话 |
+ *
+ * ⚠️ 于是"隐私"这条从"绝不"降级成"**限长**"。别再照旧注释理解这个文件：
+ * 看到 `text` 字段存在是**设计**，不是 bug。**全文永远不进台账。**
+ * 上限由 {@link LEDGER_TEXT_HEAD_MAX} 强制（调用方给多长都会被截），
+ * 理由同 `meta` 的短标量规则：**台账自己守自己的存储边界，不指望调用方**。
  *
  * ## ⚠️ 写盘失败**绝不许**影响发送
  *
@@ -77,6 +89,17 @@ export const LAYER_TRANSPORT_ACTION = 'transport-action';
 
 /** `caller` 兜底：不知道谁调的（新加了调用点却忘了传 `caller` 时会落到这里）。 */
 export const CALLER_UNKNOWN = 'unknown';
+
+/**
+ * `text` 字段最多存多少**个码点**（2026-11-18）。
+ *
+ * 按码点而不是 `String.length` 算：`Array.from` 会把 emoji / 罕见字按码点切，
+ * 不会切出半个代理对（那会让 JSON 里出现孤立的 `\ud800` 一类东西）。
+ */
+export const LEDGER_TEXT_HEAD_MAX = 200;
+
+/** `lint.samples` 最多几条（任务书：别整段可疑文本都塞进来）。 */
+export const LEDGER_LINT_SAMPLES_MAX = 5;
 
 /**
  * `DSH_HOME` 推不出来时的兜底目录 —— **本部署的实际路径**。
@@ -203,6 +226,60 @@ export function ledgerHash(text) {
 }
 
 /**
+ * 取净文本的前 {@link LEDGER_TEXT_HEAD_MAX} 个**码点**（台账 `text` 字段用）。
+ *
+ * 空串返回空串 ⇒ 调用方据此**不写这个字段**（没有这个字段 ≠ 字段是空的，
+ * 同 `echo` / `messageId` 那条规矩）。
+ *
+ * @param {unknown} text
+ * @param {number} [max]
+ * @returns {string}
+ */
+export function ledgerTextHead(text, max = LEDGER_TEXT_HEAD_MAX) {
+  const s = String(text ?? '');
+  if (s === '') return '';
+  const limit = Math.max(0, Math.floor(Number(max) || 0));
+  if (limit === 0) return '';
+  const cps = Array.from(s);
+  return cps.length <= limit ? s : cps.slice(0, limit).join('');
+}
+
+/**
+ * 把「文本判据」的结果收拾成台账能存的样子；不是对象 ⇒ `null`（不写这个字段）。
+ *
+ * 三道收口：条数 ≤ {@link LEDGER_LINT_SAMPLES_MAX}、每条文本/理由 ≤ 24 码点、
+ * 其余一律限长整数。**这里不信任调用方** —— 理由同 `meta`：`record()`
+ * 是这个文件唯一的写入闸门，越过它就没有第二道了。
+ *
+ * @param {unknown} raw
+ * @param {number} [maxSamples]
+ * @returns {{count: number, ms: number, svc: string, samples: object[]}|null}
+ */
+export function normalizeLint(raw, maxSamples = LEDGER_LINT_SAMPLES_MAX) {
+  if (raw === null || typeof raw !== 'object') return null;
+  const int = (v) => (Number.isFinite(Number(v)) ? Math.max(0, Math.floor(Number(v))) : 0);
+  const short = (v, n) => (typeof v === 'string' ? Array.from(v).slice(0, n).join('') : '');
+  const limit = Math.max(0, Math.min(20, Math.floor(Number(maxSamples) || 0)));
+  const samples = [];
+  if (Array.isArray(raw.samples)) {
+    for (const item of raw.samples) {
+      if (samples.length >= limit) break;
+      if (item === null || typeof item !== 'object') continue;
+      const text = short(item.text, 24);
+      if (text === '') continue;
+      samples.push({ pos: int(item.pos), len: int(item.len), text, reason: short(item.reason, 24) });
+    }
+  }
+  return {
+    // `count` 是"报了**几处**"，可能大于 samples.length（samples 只是前几条）
+    count: int(raw.count),
+    ms: int(raw.ms),
+    svc: short(raw.svc, 12) || 'unknown',
+    samples,
+  };
+}
+
+/**
  * 真正的底层发送动作叫什么（`transport.mjs` 里 `sendToChat` 是 `send_msg` 的包装）。
  *
  * 只用来写台账的 `action` 字段（"这一层到底调了哪个动作"），不参与判定。
@@ -324,6 +401,9 @@ export function createOutboundLedger({
    * @param {string} [input.action] 这一层调的动作名
    * @param {boolean} [input.ok] 成功/抛异常
    * @param {object} [input.meta] 少量附加标量（**绝不放正文**）
+   * @param {string} [input.textHead] 净文本**前 200 字**（2026-11-18；不是全文，见模块头）
+   * @param {object} [input.lint] 文本判据结果 `{count, ms, svc, samples}`
+   *   （`text-lint` 那一层专用；和 `textHead` 互不依赖，各自独立生效）
    * @returns {boolean} 真写了一行才 true
    */
   function record(input) {
@@ -370,6 +450,14 @@ export function createOutboundLedger({
         }
         if (Object.keys(meta).length > 0) entry.meta = meta;
       }
+      // 2026-11-18：净文本前 200 字（**不是全文**，见模块头「隐私」那一节）。
+      // 空串 ⇒ 不写这个字段（同 `echo` / `messageId`：没有 ≠ 是空的）。
+      const head = ledgerTextHead(input?.textHead);
+      if (head !== '') entry.text = head;
+      // 2026-11-18：文本判据的结果（`text-lint` 那一层专用）。
+      // ⚠️ 它**不是** `meta` 的成员：`meta` 只收短标量，装不下 `samples` 数组。
+      const lint = normalizeLint(input?.lint, LEDGER_LINT_SAMPLES_MAX);
+      if (lint !== null) entry.lint = lint;
 
       f.mkdirSync(path.dirname(cfg.file), { recursive: true });
       f.appendFileSync(cfg.file, `${JSON.stringify(entry)}\n`, 'utf8');
@@ -501,6 +589,9 @@ export function createOutboundLedger({
         chatId,
         chars: plain.length,
         sha256: ledgerHash(plain),
+        // 2026-11-18：与 `gw-send` 行同样记前 200 字 —— 两行一比就能看出
+        // 传输层有没有改写载荷（见模块头「隐私」那一节）。
+        textHead: plain,
         action: TRANSPORT_SEND_ACTION,
         ok,
         // `text:false` = 这条载荷是**段数组**（带图的），`chars` 只是文本段的长度，

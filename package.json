@@ -6,7 +6,7 @@
   "description": "给 DSH 加一个能自己开口的 QQ 通道：NapCat/OneBot 11，私聊与群聊各自独立持久会话，支持被动回复、群聊话题主动插话、工作完成汇报。",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "scripts": {
     "test": "node tools/run-all-tests.mjs",

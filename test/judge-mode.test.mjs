@@ -30,6 +30,7 @@ import {
   resolvePrecheckModel,
 } from '../src/dsh/judge-mode.mjs';
 import { T0, gaugeStub, groupEvent, harness, makeStream, privateEvent, sendTwo } from './judge-mode-harness.mjs';
+import { renderEntries } from '../src/proactive/engine.mjs';
 
 // ------------------------------------------------------- 纯函数（解析/归一化）
 
@@ -156,11 +157,18 @@ test('模式 1（默认）：不配新键 ⇒ precheck 一次都不调，提示�
   assert.doesNotMatch(h.responded[0].prompt, /要不要接，由你自己定/);
   assert.doesNotMatch(h.responded[0].prompt, /倾向/);
   // 逐字对照：环境轮提示词 = 转录 + 固定的那句要求（改动前就是这个形状）
+  //
+  // ⚠️ 2026-11-10：转录现在也会写下**她自己发出去的那句**（`fromSelf`），而这条环境轮
+  //    提示词是在**发出去之前**拼的 —— 所以这里对照"入站那串"（剔掉 `fromSelf` 之后
+  //    与改动前逐字一致），否则断言会把她这一轮的回复也算进"先前聊天"。
+  const inboundOnly = h.engine.transcript('group:100').snapshot()
+    .filter((m) => m?.fromSelf !== true)
+    .slice(-20);
   assert.equal(
     h.responded[0].prompt,
     [
       '群里刚在聊：',
-      h.engine.transcript('group:100').render(20),
+      renderEntries(inboundOnly),
       '',
       '你想接一句话。要求：只回一句、不超过 40 字、像在群里随口接话、'
         + '不要 Markdown、不要解释你在做什么、不要重复别人说过的话。',

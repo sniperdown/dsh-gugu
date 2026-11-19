@@ -19,10 +19,20 @@
  */
 
 import { looksLikeQuestion } from '../dsh/heuristic-gauge.mjs';
+// 本地聊天记录（2026-11-18）：`createChatLog()` 默认**关着**（`enabled:false`），
+// 关着时一个字节都不碰磁盘 —— 所以测试里构造引擎不会污染真实聊天记录。
+import { createChatLog, wireOf } from '../dsh/chat-log.mjs';
 
 /** 会话类型：私聊或群聊。 */
 export const PRIVATE = 'private';
 export const GROUP = 'group';
+
+/**
+ * 她自己没配昵称时的兜底显示名（只用于转录渲染，与人格无关）。
+ *
+ * 自己发出去的那句渲染成 `我(小鲸鱼)`，形状与入站的 `昵称(QQ)` 一致。
+ */
+export const DEFAULT_SELF_NICKNAME = '小鲸鱼';
 
 /** 毫秒常量，避免魔法数字散落。 */
 const MINUTE = 60_000;
@@ -409,7 +419,12 @@ export function renderEntries(entries, imageText = null, { now = Date.now(), utc
   return entries
     .map((m) => {
       const body = typeof imageText === 'function' ? applyImageText(m.text, imageText(m)) : m.text;
-      return `[${formatStamp(m.at, { now, utcOffsetMinutes })}] ${m.nickname}(${m.userId}): ${body}`;
+      // 自己发出去的那句（2026-11-10）：入站行是 `昵称(QQ)`，自己的行换成 `我(小鲸鱼)`
+      // —— 同一个括号形态，一眼能认，又不会破坏既有行的形状（只多一条 `fromSelf` 分支）。
+      const who = m.fromSelf === true
+        ? `我(${String(m.nickname ?? '').trim() || DEFAULT_SELF_NICKNAME})`
+        : `${m.nickname}(${m.userId})`;
+      return `[${formatStamp(m.at, { now, utcOffsetMinutes })}] ${who}: ${body}`;
     })
     .join('\n');
 }
@@ -821,6 +836,52 @@ export class ChatState {
  *    连模型都不叫——这是省钱也是防刷屏的第一道。
  * 2. **判定**（注入的 `gauge`）：闸门放行后才问模型「这话题你要不要说、说什么」。
  */
+/**
+ * 一条转录条目的**去重键**（2026-11-18）。
+ *
+ * 有 `messageId` 就用它（那是 NapCat 的真实身份，也是 `restore()` 用的键）；
+ * 没有就退回"时刻 + 方向 + 正文" —— 只是为了防止两条回灌路径
+ * （`transcripts.json` 与 `qq-chatlog.jsonl`）把同一条消息灌两遍。
+ *
+ * @param {InboundMessage} m
+ * @returns {string}
+ */
+export function transcriptEntryKey(m) {
+  if (m === null || typeof m !== 'object') return '';
+  if (typeof m.messageId === 'number' && Number.isFinite(m.messageId)) return `id:${m.messageId}`;
+  return `at:${Number(m.at) || 0}|${m.fromSelf === true ? 'self' : 'other'}|${String(m.text ?? '')}`;
+}
+
+/**
+ * 聊天记录的一行 → 转录条目（回灌 / 引用回查共用）。
+ *
+ * 字段映射：`dir:'out'` ⇒ `fromSelf:true` + `userId:''`（与 `noteSelfMessage`
+ * 造出来的形状**逐字一致**，否则同一个会话里两批条目渲染出来会不一样）。
+ *
+ * @param {object} row `chat-log.mjs` 的行
+ * @returns {InboundMessage|null} 坏行 ⇒ null（不抛）
+ */
+export function chatLogRowToEntry(row) {
+  if (row === null || typeof row !== 'object') return null;
+  const body = String(row.text ?? '').trim();
+  const at = Number(row.at);
+  const chatId = String(row.chatId ?? '').trim();
+  if (body === '' || chatId === '' || !Number.isFinite(at) || at <= 0) return null;
+  const self = row.dir === 'out';
+  const entry = {
+    chatId,
+    kind: row.kind === PRIVATE ? PRIVATE : GROUP,
+    userId: self ? '' : String(row.userId ?? ''),
+    nickname: String(row.nickname ?? ''),
+    text: body,
+    at,
+    fromSelf: self,
+  };
+  const id = Number(row.messageId);
+  if (Number.isFinite(id)) entry.messageId = id;
+  return entry;
+}
+
 export class ProactiveEngine {
   /**
    * 「cap < 阈值」那条 warn 只打一次（见 `declineBonus`）。
@@ -861,6 +922,20 @@ export class ProactiveEngine {
   constructor({
     config, gauge, speak, allowed, log = () => {}, now = () => Date.now(), names = [], overrides = null,
     judgeMode = 'heuristic', precheck = null,
+    /**
+     * **本地聊天记录**（`chat-log.mjs` 的 `createChatLog(...)` 产物，2026-11-18 加）。
+     *
+     * 三态，和 `gateway.outboundLedger` 同一条规矩但多一档：
+     *   · 不传（缺省）⇒ 现造一个**默认配置**的（默认 `enabled:false` = "装了但一行不写"；
+     *     要开就注入 `{config:{enabled:true}}`，或设 `QQ_CHATLOG_PATH`）；
+     *   · `null` ⇒ 明确关掉（连对象都不造）；
+     *   · 给了对象 ⇒ 就用它（测试注入假件走这条）。
+     *
+     * ⚠️ 为什么默认不写：引擎在测试里被构造几百次，默认落盘等于每跑一次 `npm test`
+     * 就往**真实聊天记录**里灌一遍假消息。`outbound-ledger` / `gauge-log` 都选了
+     * "注入式 / 默认关"，这里是同一条理由。
+     */
+    chatLog = undefined,
   }) {
     this.config = { ...defaultTriggerConfig(), ...config };
     /**
@@ -933,6 +1008,19 @@ export class ProactiveEngine {
      */
     this.lastGaugeEntry = null;
     this.stopped = false;
+    /**
+     * 本地聊天记录（可为 null）。**只写不读**，唯一的读口有两个：
+     *   ① 构造时回灌（{@link ProactiveEngine#replayChatLog}）；
+     *   ② 引用回查（{@link ProactiveEngine#findChatLogMessage}）。
+     * @type {ReturnType<typeof createChatLog>|null}
+     */
+    this.chatLog = chatLog === null
+      ? null
+      : (chatLog === undefined ? createChatLog({ log: this.log }) : chatLog);
+    // 启动时**先读本地**（"先本地、后 NapCat 补"里的前半句）。
+    // 顺序很重要：它必须在任何实时消息进转录之前跑完，否则 `push()` 的
+    // "时间戳倒退就丢"会把整批本地记录静默吃掉（那正是"重启后她说过的话全没了"）。
+    this.replayChatLog();
   }
 
   /**
@@ -1024,11 +1112,89 @@ export class ProactiveEngine {
       .sort((a, b) => Number(a.at) - Number(b.at));
     if (list.length === 0) return 0;
     const transcript = this.transcript(chatId);
+    /**
+     * 去重（2026-11-18 加，**别删**）。
+     *
+     * 现在有**两份**落盘会被回灌：`qq-gugu/state/transcripts.json`（`index.mjs`
+     * 每 20 秒整文件重写）与 `media/qq-chatlog.jsonl`（`chat-log.mjs` 追加）。
+     * 两条路都会 `push()` 进同一个转录，而 `push()` 只拒"比上一条**旧**"——
+     * 时间戳**相等**是放行的 ⇒ 同一条消息会进转录两遍，
+     * 表现是模型看到"自己刚说过的话又出现一次"，接着开始复读。
+     */
+    const seen = new Set(transcript.snapshot().map(transcriptEntryKey));
     let restored = 0;
     for (const m of list) {
-      if (transcript.push(m) === true) restored += 1;
+      const key = transcriptEntryKey(m);
+      if (seen.has(key)) continue;
+      if (transcript.push(m) === true) {
+        seen.add(key);
+        restored += 1;
+      }
     }
     return restored;
+  }
+
+  /**
+   * **启动时先读本地**（2026-11-18）：把 `chat-log.mjs` 里攒下的记录灌回转录。
+   *
+   * 为什么需要它：转录是**纯内存**的，插件一重载/重启就空；`history-backfill.mjs`
+   * 只能补**别人**说的话（NapCat 历史里她自己那几句被单独拆走、只留最后一条）。
+   * 于是"重启之后她说过什么"只能由本地记录负责。
+   *
+   * 三条纪律：
+   * 1. **只读 `delivered !== false` 的行**（闸门在 `chat-log.mjs` 的 `isReplayable`）。
+   *    失败行灌进来，她会以为那句没发出去的话已经说过了，从此不再提 —— 比不知道更糟。
+   * 2. **`hardCap` = 转录自己的上限**（缺省 60）。**别传"我想要的条数"**：传大只会
+   *    先把内存撑到上限之外再被 `#trim` 砍回来，看起来灌了 200 条其实只剩 60 条。
+   * 3. **不判定、不发言**：它和 `restoreTranscript` 同一性质，只写内存。
+   *
+   * @returns {number} 灌进转录几条（0 = 没开 / 没记录 / 读失败）
+   */
+  replayChatLog() {
+    const sink = this.chatLog;
+    if (sink === null || sink === undefined || typeof sink.replayByChat !== 'function') return 0;
+    try {
+      const chats = sink.replayByChat();
+      let chatCount = 0;
+      let entries = 0;
+      for (const [chatId, rows] of chats ?? []) {
+        const list = (Array.isArray(rows) ? rows : []).map(chatLogRowToEntry).filter(Boolean);
+        if (list.length === 0) continue;
+        const transcript = this.transcript(chatId);
+        const restored = transcript.restore(list, { hardCap: transcript.maxMessages });
+        if (restored > 0) {
+          chatCount += 1;
+          entries += restored;
+        }
+      }
+      if (entries > 0) this.log('info', `本地聊天记录：已恢复 ${chatCount} 个会话 / ${entries} 条`, {});
+      return entries;
+    } catch (error) {
+      this.#chatLogLog('warn', '本地聊天记录：恢复失败（忽略，继续用 NapCat 回填）', error);
+      return 0;
+    }
+  }
+
+  /**
+   * 按 `(chatId, messageId)` 从本地聊天记录里找一条 —— 给引用回查用（同步）。
+   *
+   * 为什么需要：`#findQuoted` 是**纯同步**的（被 `#buildPrompt` 十几处拼接共用），
+   * 而转录只有 60 条窗口。引一条"她 5 分钟前说的、已被挤出窗口或跨重启"的消息时，
+   * 原来只能退到一次 `get_msg`（异步、要单独预取），或者干脆"原文没找到"。
+   *
+   * @param {string} chatId
+   * @param {unknown} messageId
+   * @returns {import('./engine.mjs').InboundMessage|null}
+   */
+  findChatLogMessage(chatId, messageId) {
+    const sink = this.chatLog;
+    if (sink === null || sink === undefined || typeof sink.find !== 'function') return null;
+    try {
+      const row = sink.find(chatId, messageId);
+      return row === null || row === undefined ? null : chatLogRowToEntry(row);
+    } catch {
+      return null;
+    }
   }
 
   /** 某会话的转录（懒创建）。 */
@@ -1053,7 +1219,196 @@ export class ProactiveEngine {
   ingest(message) {
     if (message === null || message === undefined) return false;
     if (message.fromSelf === true) return false;
-    return this.transcript(message.chatId).push(message);
+    const accepted = this.transcript(message.chatId).push(message);
+    // 被接受才落盘（磁盘与内存必须一致，见 `#logInbound`）。
+    if (accepted === true) this.#logInbound(message);
+    return accepted;
+  }
+
+  /**
+   * **她发出去的那句也进转录**（2026-11-10）。
+   *
+   * ## 为什么需要它
+   *
+   * 转录原来只收**入站**消息（`decide()` 对 `fromSelf` 提前 return）。于是"群里刚在聊"
+   * 这段里**没有她自己刚说过的话** —— 下一轮只能靠会话上下文里那点历史回忆，群一热闹
+   * 就把"哪句是我说的"搞混。用户 2026-11-10 明确要求：群聊优先，私聊一起做。
+   *
+   * ## 与 `ingest()` 的分工
+   *
+   * - `ingest()`：**别人**说的话（`fromSelf` 一律拒）；
+   * - 本方法：**她自己**发出去的一句话，`fromSelf: true` + 名字进 `nickname`，
+   *   渲染出来是 `[HH:MM] 我(小鲸鱼): 正文`（见 `renderEntries`）。
+   *
+   * ⚠️ 它**只写内存**：不碰闸门、不记账、不触发任何判定（和 `ingest` 同一保证）。
+   * ⚠️ 空正文 / 静默标记 / 发送失败的过滤在**调用方**（网关 `#sendOne`）——
+   *   那里才知道"这条到底发出去没有"，引擎不做猜测。
+   *
+   * ## 2026-11-18：补 `messageId` + 顺手落盘
+   *
+   * 传输层的 `sendToChat` 返回的就是 NapCat 的 `message_id`（`transport.mjs` 的
+   * `sendMsg` → `data?.message_id`），而 `#sendOne` 手里一直拿着它 —— 只是没往下传。
+   * 没有它，`#findQuoted`（按 `messageId` 找原文）**永远对不上她自己说过的话**，
+   * 只能退到一次 `get_msg`。
+   *
+   * ## ⚠️ 顺序写死：**内存先、磁盘后**（R7）
+   *
+   * 反过来的话，写盘失败会被上游读成"没发出去"而**重发一次**。
+   * 所以：先 `push` 进转录（那是"她这一轮记得自己说了什么"），**再**落盘（只服务重启）；
+   * 落盘失败只降级成一条日志，**绝不回传给任何调用方**。
+   *
+   * @param {string} chatId
+   * @param {string} text 真的到 QQ 上的那段正文
+   * @param {number} [at] 毫秒时间戳，缺省用注入时钟
+   * @param {object} [extra]
+   * @param {number|string|null} [extra.messageId] 传输层回来的 `message_id`（拿不到就传 null，**别编**）
+   * @param {string} [extra.wire] 段类型序列（`text,image`），只记类型不记内容
+   * @returns {boolean} 是否被接受（时间戳倒退的乱序条目会被拒，见 `Transcript.push`）
+   */
+  noteSelfMessage(chatId, text, at, extra = {}) {
+    const id = String(chatId ?? '');
+    const body = String(text ?? '').trim();
+    if (id === '' || body === '') return false;
+    const stamp = Number(at);
+    const rawId = Number(extra?.messageId);
+    const entry = {
+      chatId: id,
+      kind: id.startsWith(`${PRIVATE}:`) ? PRIVATE : GROUP,
+      userId: '',
+      nickname: this.names.length > 0 ? this.names[0] : DEFAULT_SELF_NICKNAME,
+      text: body,
+      at: Number.isFinite(stamp) && stamp > 0 ? stamp : this.now(),
+      fromSelf: true,
+    };
+    // 拿不到 id 时**不写这个键**（`undefined` 与"有 id"在回灌去重里是两回事）。
+    if (Number.isFinite(rawId)) entry.messageId = rawId;
+    const accepted = this.transcript(id).push(entry) === true;
+    // 内存写完了才落盘；**不管内存收没收**（那条消息确实发出去了，磁盘是事实记录）。
+    this.#logOutbound(id, entry, { wire: extra?.wire });
+    return accepted;
+  }
+
+  /**
+   * **发送失败的落盘**（2026-11-18）：只在聊天记录里留一条 `delivered:false` + `error`。
+   *
+   * ## 为什么不进内存
+   *
+   * 内存里那条会被渲染进提示词。让"她以为说了、其实没发出去"的话进上下文，她会
+   * **以为那句话已经说过了**，从此不再提 —— 比不知道更糟。所以：
+   * **双向写（成功行 + 失败行）、单向读（回灌时过滤掉失败行）**。
+   *
+   * 唯一用途是**人工排查**："她到底收/发了什么"有原始副本。
+   * 过滤是 `chat-log.mjs` 的 `isReplayable` 那一行，测试里钉着。
+   *
+   * @param {string} chatId
+   * @param {string} text 本来要发的那段正文
+   * @param {number} [at]
+   * @param {object} [extra] `error`（异常或串）/ `wire`
+   * @returns {boolean} 写进去了没有
+   */
+  noteFailedSend(chatId, text, at, extra = {}) {
+    const id = String(chatId ?? '').trim();
+    const body = String(text ?? '').trim();
+    if (id === '' || body === '') return false;
+    const stamp = Number(at);
+    const error = extra?.error instanceof Error
+      ? String(extra.error.message ?? extra.error)
+      : String(extra?.error ?? 'unknown');
+    return this.#logOutbound(id, {
+      chatId: id,
+      kind: id.startsWith(`${PRIVATE}:`) ? PRIVATE : GROUP,
+      nickname: this.names.length > 0 ? this.names[0] : DEFAULT_SELF_NICKNAME,
+      text: body,
+      at: Number.isFinite(stamp) && stamp > 0 ? stamp : this.now(),
+      fromSelf: true,
+    }, { delivered: false, error, wire: extra?.wire });
+  }
+
+  /** 某会话的聊天记录统计（给排查用；没开就是 `enabled:false`，不碰磁盘）。 */
+  chatLogStats() {
+    const sink = this.chatLog;
+    if (sink === null || sink === undefined || typeof sink.stats !== 'function') return null;
+    try {
+      return sink.stats();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * **落一条出站行**（内存已经写完才调；本方法绝不抛）。
+   * @private
+   */
+  #logOutbound(chatId, entry, extra = {}) {
+    const sink = this.chatLog;
+    if (sink === null || sink === undefined || typeof sink.record !== 'function') return false;
+    try {
+      return sink.record({
+        dir: 'out',
+        chatId,
+        kind: entry.kind,
+        nickname: entry.nickname,
+        text: entry.text,
+        at: entry.at,
+        messageId: entry.messageId,
+        delivered: extra.delivered !== false,
+        error: extra.error,
+        wire: extra.wire,
+      }) === true;
+    } catch (error) {
+      this.#chatLogLog('warn', '聊天记录：出站落盘失败（忽略，不影响这条消息）', error, { chatId });
+      return false;
+    }
+  }
+
+  /**
+   * **落一条入站行**（别人说的话被转录接受时调）。
+   *
+   * 只在 `push()` 返回 `true` 时调 —— **磁盘和内存必须一致**：被"时间戳倒退"拒掉的
+   * 消息不进内存，也就绝不落盘（否则重启一次它就"复活"了，而当时明明没收到）。
+   *
+   * @param {InboundMessage} message
+   * @returns {boolean}
+   * @private
+   */
+  #logInbound(message) {
+    const sink = this.chatLog;
+    if (sink === null || sink === undefined || typeof sink.record !== 'function') return false;
+    try {
+      const id = Number(message?.messageId);
+      // 没有 id 的入站消息**干脆不入库**：回灌去重只能靠 `messageId`，
+      // 拿时间戳+昵称拼一个假身份会让同一条消息进转录两遍（R3）。
+      if (!Number.isFinite(id)) return false;
+      return sink.record({
+        dir: 'in',
+        chatId: message.chatId,
+        kind: message.kind,
+        userId: message.userId,
+        nickname: message.nickname,
+        text: message.text,
+        at: message.at,
+        messageId: id,
+        wire: wireOf(message.segments),
+      }) === true;
+    } catch (error) {
+      this.#chatLogLog('warn', '聊天记录：入站落盘失败（忽略）', error, { chatId: message?.chatId });
+      return false;
+    }
+  }
+
+  /**
+   * 一条降级日志（**自己吞异常**：logger 也不可信）。
+   * @private
+   */
+  #chatLogLog(level, message, error, meta = {}) {
+    try {
+      this.log(level, message, {
+        ...meta,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } catch {
+      /* 日志自己坏了就什么都不说 */
+    }
   }
 
   /**
@@ -1130,7 +1485,9 @@ export class ProactiveEngine {
     }
 
     const transcript = this.transcript(message.chatId);
-    transcript.push(message);
+    // 落盘只在**被接受**时发生：`push` 拒掉的时间戳倒退消息不该在磁盘上留着
+    // （否则重启一次它就"复活"了，而当时明明没进上下文）。见 `#logInbound`。
+    if (transcript.push(message) === true) this.#logInbound(message);
     const state = this.state(message.chatId);
     state.noteUserMessage(message.at);
 
@@ -1456,7 +1813,12 @@ export class ProactiveEngine {
         kind: message.kind,
         userId: message.userId,
         transcript: transcript.render(20),
-        recent: transcript.snapshot().slice(-20),
+        // ⚠️ 打分窗口**剔除** `fromSelf` 条目：转录也会收她自己发出去的话
+        // （`noteSelfMessage`），而判定层算「我说了几次」有**两条**来源 ——
+        // 窗口里的 `fromSelf` 条目 + `selfAt` 的时间戳数组（见 `selfCountInWindow`）。
+        // 两条同时命中同一次发言就是**重复计数**，`selfRatio` 会虚高、存在感分跟着漂。
+        // 自己那句话仍然通过 `selfAt` 计入 —— 打分行为零漂移。
+        recent: transcript.snapshot().filter((m) => m?.fromSelf !== true).slice(-20),
         now: message.at,
         // 强相关信号必须从**触发消息**上带下来。
         //

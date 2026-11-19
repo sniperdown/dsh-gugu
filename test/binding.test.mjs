@@ -21,6 +21,7 @@ import {
   SessionBinder,
   sessionKeyForChat,
   DEFAULT_GROUP_DENY_TOOLS,
+  ALWAYS_DENY_TOOLS,
   GROUP_DENY_HOST_PREFIXES,
   GROUP_DENY_HOST_EXACT,
   pickGroupDeniedHostTools,
@@ -883,16 +884,36 @@ function fakeAgentWithTools({ restrict, register, schemas = () => [], replyQueue
   const agent = fakeAgent({ replyQueue });
   // 给个 cwd：没有的话 runTurn 会记一条"没有 cwd"的 warn，干扰按 level 计数的断言。
   agent.session.header = { cwd: 'H:\\work' };
-  /** @type {Array<object>} */
+  /**
+   * 每条 `restrict` 调用一条，`released` 记它是**还生效**还是**已经撤销**。
+   *
+   * 为什么要区分：`partitionRestrictable()` 的探测做法就是"调一次 restrict 拿到
+   * disposer、立刻撤销"（只探不吃层）。真实宿主里撤销掉的限制**不在生效**，
+   * 所以假宿主也不能把它算成一条限制 —— 否则"探测"会污染所有 `restrictCalls` 断言。
+   *
+   * @type {Array<{filter: object, released: boolean}>}
+   */
   const calls = [];
   /** @type {Array<object>} */
   const registrations = [];
   agent.ctx = {
     tools: {
       restrict(filter) {
-        calls.push(filter);
-        if (restrict !== undefined) return restrict(filter);
-        return () => {};
+        const entry = { filter, released: false };
+        calls.push(entry);
+        if (restrict !== undefined) {
+          try {
+            restrict(filter);
+          } catch (error) {
+            // 抛错 = 这一层根本没挂上（宿主的 `names unknown global tool` 一类）：
+            // 它不该算"已生效的限制"。探测失败与真实失败都是这个形状。
+            entry.released = true;
+            throw error;
+          }
+        }
+        return () => {
+          entry.released = true;
+        };
       },
       // 2026-10-18（方案 B）：宿主 agent 作用域的 `tools.register`。
       // 工具注册只往这里挂；旧替身缺这个方法，于是它会多打一条
@@ -911,9 +932,23 @@ function fakeAgentWithTools({ restrict, register, schemas = () => [], replyQueue
       },
     },
   };
-  agent.restrictCalls = calls;
+  // 只报**还生效**的限制：探测（调一次、立刻撤销）不算层，理由见上面 `calls` 的注释。
+  Object.defineProperty(agent, 'restrictCalls', {
+    enumerable: true,
+    get: () => calls.filter((entry) => !entry.released).map((entry) => entry.filter),
+  });
   agent.registrations = registrations;
   return agent;
+}
+
+/**
+ * 「所有 QQ 会话都收掉」的那一条 `restrict` 调用（名单来自 `ALWAYS_DENY_TOOLS`）。
+ *
+ * 用它拼期望值而不是在每个用例里重抄一遍名字：**名单本身**由一条专门的用例钉死
+ * （"常收名单：私聊和群都收、且收不到的名字不报错"那一组），这里只关心"有没有多这一层"。
+ */
+function alwaysDeniedCall() {
+  return { deny: ALWAYS_DENY_TOOLS.slice() };
 }
 
 /**
@@ -1004,7 +1039,11 @@ test('群会话：建会话时调 restrict，deny 就是名单（默认 pwsh）'
 
   assert.equal(created, true);
   assert.equal(setupCalls.length, 1, 'resume 成功就只该有一次');
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }], '群会话必须收掉 pwsh');
+  assert.deepEqual(
+    agent.restrictCalls,
+    [{ deny: ['pwsh'] }, alwaysDeniedCall()],
+    '群会话必须收掉 pwsh，并叠上"所有 QQ 会话都收"的那一条',
+  );
 });
 
 test('pickGroupDeniedHostTools：只挑 ops_* / dsh_browser_* / screen_view', () => {
@@ -1112,7 +1151,12 @@ test('私聊：可见表里有 ops/browser/screen_view 也一个都不收（用�
 
   await binder.ensure('qq-private-30000001');
 
-  assert.deepEqual(agent.restrictCalls, [], '私聊保留全套（含内置浏览器，2026-10-24 实测能用的那条路）');
+  assert.deepEqual(
+    agent.restrictCalls,
+    [alwaysDeniedCall()],
+    '私聊保留全套（含内置浏览器，2026-10-24 实测能用的那条路）；' +
+      '只有"QQ 上根本用不了"的那几个照收（不按会话类型）',
+  );
 });
 
 test('群会话：建会话时两道都挂 —— 宿主工具族 + pwsh 兜底', async () => {
@@ -1128,6 +1172,7 @@ test('群会话：建会话时两道都挂 —— 宿主工具族 + pwsh 兜底'
   assert.deepEqual(agent.restrictCalls, [
     { deny: ['ops_bash', 'screen_view'] },
     { deny: ['pwsh'] },
+    alwaysDeniedCall(),
   ]);
 });
 
@@ -1139,7 +1184,7 @@ test('群会话：resume 失败回退 create 的那条路也要收口', async ()
   await binder.ensure('qq-group-30000011');
 
   assert.equal(setupCalls.length, 1, '只有 create 那一次');
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()]);
 });
 
 test('私聊：一次都不调 restrict（那是"联系不上主会话时的备用通道"，保留全套）', async () => {
@@ -1150,7 +1195,8 @@ test('私聊：一次都不调 restrict（那是"联系不上主会话时的备�
   await binder.ensure('qq-private-30000001');
 
   assert.equal(setupCalls.length, 1, '会话照样建起来');
-  assert.deepEqual(agent.restrictCalls, [], '私聊不该被限制');
+  // 私聊**不收**群会话那几条（pwsh / ops / browser），但"QQ 上根本用不了"的那几个照收。
+  assert.deepEqual(agent.restrictCalls, [alwaysDeniedCall()], '私聊不该被按群收口');
 });
 
 test('未知会话（dmRouting=main 的主会话）：不限制', async () => {
@@ -1160,7 +1206,11 @@ test('未知会话（dmRouting=main 的主会话）：不限制', async () => {
 
   await binder.ensure('session-00000000-0000-0000-0000-000000000000');
 
-  assert.deepEqual(agent.restrictCalls, [], '主会话自己的会话不能被当成群会话收口');
+  assert.deepEqual(
+    agent.restrictCalls,
+    [alwaysDeniedCall()],
+    '主会话自己的会话不能被当成群会话收口；常收那条与会话类型无关，照挂',
+  );
 });
 
 test('★ restrict 抛错时：会话照常建立、不崩，走 warn 且把合法工具名清单记进日志', async () => {
@@ -1254,7 +1304,7 @@ test('复用已有 agent 时也要收口（热重载后走的就是这条路）'
 
   assert.equal(created, false);
   assert.equal(handle.agent, liveAgent);
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }], '复用路径也必须收口');
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()], '复用路径也必须收口');
 });
 
 test('复用已有 agent：私聊与未知会话都不收口', async () => {
@@ -1280,7 +1330,8 @@ test('复用已有 agent：私聊与未知会话都不收口', async () => {
   await binder.ensure('qq-private-30000001');
   await binder.ensure('session-00000000');
 
-  assert.deepEqual(agent.restrictCalls, []);
+  // 两条会话共用一个 ctx：常收那条只叠一次（台账判重），群会话那几条一条都不叠。
+  assert.deepEqual(agent.restrictCalls, [alwaysDeniedCall()]);
 });
 
 test('同一会话只收口一次（第二次 ensure 命中缓存，不重复叠加限制）', async () => {
@@ -1292,7 +1343,110 @@ test('同一会话只收口一次（第二次 ensure 命中缓存，不重复叠
   await binder.ensure('qq-group-30000011');
 
   assert.equal(setupCalls.length, 1);
-  assert.equal(agent.restrictCalls.length, 1, '不要每次 ensure 都往 agent 上叠一层限制');
+  // 两层：群会话那层 + 所有会话常收那层。各一次，不随 ensure 次数增长。
+  assert.equal(agent.restrictCalls.length, 2, '不要每次 ensure 都往 agent 上叠一层限制');
+});
+
+// ------------------------------------- 常收的工具（QQ 上根本用不了的那几个）
+//
+// 需求：**`ask_user_question` / `plugin_manager` 在 QQ 上的任何会话里都不能出现** ——
+// 不看是群还是私聊。前者把选项框弹在电脑屏幕上（QQ 那边看不见 ⇒ 整个会话卡死，
+// 这是当初单独做 `gugu` preset 的首要原因），后者每次调用都要一次桌面审批（同样卡死），
+// 而且它能改整个 profile 的插件。
+//
+// 为什么不在 preset 里关：自定义 preset 是**手工镜像**内置 `standard` 的，DSH 一升级
+// 就漏（`time-context`、`ops` 工具都真漏过，且不报错）。所以改用内置 preset + 这里的
+// 代码收口。⚠️ `restrict` 是 per-agent 的、**子会话不继承** —— 这个缺口用户已明确接受。
+
+test('常收名单：`ask_user_question` 与 `plugin_manager` 两个名字都要在', () => {
+  // 名字写错不会报错（`partitionRestrictable` 会把收不到的名字当"本来就没有"跳过），
+  // 所以这一条是**唯一**能钉住"我们收的确实是真名字"的地方。
+  assert.deepEqual(ALWAYS_DENY_TOOLS, ['ask_user_question', 'plugin_manager']);
+});
+
+test('常收：私聊也收（弹框卡死与群/私聊无关）', async () => {
+  const agent = fakeAgentWithTools();
+  const { agents } = agentsWithSetup(agent);
+  const binder = new SessionBinder({ ctx: { agents } });
+
+  await binder.ensure('qq-private-30000001');
+
+  assert.deepEqual(agent.restrictCalls, [alwaysDeniedCall()], '私聊必须也收掉这两个');
+});
+
+test('常收：群会话与私聊都会走到这个收口（两处都要调，不是只挂一条路）', async () => {
+  const group = fakeAgentWithTools();
+  const groupAgents = agentsWithSetup(group);
+  const groupBinder = new SessionBinder({ ctx: { agents: groupAgents.agents } });
+
+  const priv = fakeAgentWithTools();
+  const privAgents = agentsWithSetup(priv);
+  const privBinder = new SessionBinder({ ctx: { agents: privAgents.agents } });
+
+  await groupBinder.ensure('qq-group-30000011');
+  await privBinder.ensure('qq-private-30000001');
+
+  assert.ok(
+    group.restrictCalls.some(
+      (call) => Array.isArray(call.deny) && call.deny.length === 2 && call.deny.includes('ask_user_question')
+        && call.deny.includes('plugin_manager'),
+    ),
+    `群会话也要收，实际：${JSON.stringify(group.restrictCalls)}`,
+  );
+  assert.deepEqual(priv.restrictCalls, [alwaysDeniedCall()]);
+});
+
+test('常收：收不到的名字静默跳过，只留 debug、不报错（preset 上本来就没注册它）', () => {
+  // 真机形状：`gugu` preset 上 `ask_user_question` 根本没注册 —— 直接
+  // `restrict({ deny: ['ask_user_question', ...] })` 会整条失败（一次校验全部名字）。
+  const logs = [];
+  const agent = fakeAgentWithTools({
+    restrict: (filter) => {
+      // 模拟真机：`ask_user_question` 收得到，`plugin_manager` 在这个 preset 上没注册。
+      if (filter.deny.includes('plugin_manager')) {
+        throw new Error('tools.restrict() names unknown global tool "plugin_manager"');
+      }
+      return () => {};
+    },
+  });
+  const binder = new SessionBinder({ ctx: { agents: {} }, log: (level, message) => logs.push({ level, message }) });
+
+  const applied = binder.alwaysDeniedBackstop(agent.ctx, 'qq-private-30000001', 'setup');
+
+  assert.equal(applied, true, '收得到的那个照样收');
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['ask_user_question'] }], '只把收得到的放进 deny');
+  assert.equal(logs.filter((l) => l.level === 'warn').length, 0, '这不该是告警');
+  assert.ok(
+    logs.some((l) => l.level === 'debug' && l.message.includes('plugin_manager')),
+    `该留一条 debug 说明跳过了谁，实际：${JSON.stringify(logs)}`,
+  );
+});
+
+test('常收：一个都收不到时不调 restrict（空 filter 会被宿主拒），也不报错', () => {
+  const logs = [];
+  const agent = fakeAgentWithTools({
+    restrict: () => {
+      throw new Error('tools.restrict() names unknown global tool "ask_user_question"');
+    },
+  });
+  const binder = new SessionBinder({ ctx: { agents: {} }, log: (level, message) => logs.push({ level, message }) });
+
+  const applied = binder.alwaysDeniedBackstop(agent.ctx, 'qq-private-30000001', 'setup');
+
+  assert.equal(applied, false);
+  assert.deepEqual(agent.restrictCalls, [], '收不到就别调 restrict');
+  assert.equal(logs.filter((l) => l.level === 'warn').length, 0, '收不到不是故障');
+});
+
+test('常收：同一个 ctx 只叠一次（ensure / equip / 复用都会走进来）', async () => {
+  const agent = fakeAgentWithTools();
+  const { agents } = agentsWithSetup(agent);
+  const binder = new SessionBinder({ ctx: { agents } });
+
+  await binder.ensure('qq-private-30000001');
+  binder.alwaysDeniedBackstop(agent.ctx, 'qq-private-30000001', 'reuse');
+
+  assert.deepEqual(agent.restrictCalls, [alwaysDeniedCall()], '台账判重，不要叠第二层');
 });
 
 test('名单可配置：配了别的名单就按配置来', async () => {
@@ -1305,7 +1459,7 @@ test('名单可配置：配了别的名单就按配置来', async () => {
 
   await binder.ensure('qq-group-30000011');
 
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh', 'read', 'write'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh', 'read', 'write'] }, alwaysDeniedCall()]);
 });
 
 test('名单配成空数组 = 群里不限制任何工具（留的退路）', async () => {
@@ -1315,7 +1469,12 @@ test('名单配成空数组 = 群里不限制任何工具（留的退路）', as
 
   await binder.ensure('qq-group-30000011');
 
-  assert.deepEqual(agent.restrictCalls, [], '空名单不该调 restrict（空 filter 本身也会被宿主拒）');
+  // 群那份配空 = 群里不限制；但"QQ 上根本用不了"的那几个不归这个开关管。
+  assert.deepEqual(
+    agent.restrictCalls,
+    [alwaysDeniedCall()],
+    '空名单不该调 restrict（空 filter 本身也会被宿主拒）',
+  );
 });
 
 test('名单过滤：空串/非字符串/重复项都进不了 restrict 的参数', async () => {
@@ -1328,7 +1487,7 @@ test('名单过滤：空串/非字符串/重复项都进不了 restrict 的参�
 
   await binder.ensure('qq-group-30000011');
 
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh', 'read', 'write'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh', 'read', 'write'] }, alwaysDeniedCall()]);
 });
 
 test('传给 restrict 的是名单的副本（外部改不到 binder 的状态）', async () => {
@@ -1489,7 +1648,11 @@ test('★★ 群 preset 挂上了：不再叠 restrict 兜底（收不了 preset
 
   await binder.ensure('qq-group-30000011');
 
-  assert.deepEqual(agent.restrictCalls, [], '工具本来就不在，别再叠一层收不了名字的 restrict');
+  assert.deepEqual(
+    agent.restrictCalls,
+    [alwaysDeniedCall()],
+    '工具本来就不在，别再叠一层收不了名字的 restrict；常收那条与预设无关，照挂',
+  );
 });
 
 test('★★ 群 preset 挂不上、退回私聊那份时：restrict 兜底还在（保险丝没拆）', async () => {
@@ -1506,7 +1669,7 @@ test('★★ 群 preset 挂不上、退回私聊那份时：restrict 兜底还�
   await binder.ensure('qq-group-30000011');
 
   assert.deepEqual(presets.mounts, ['gugu-lite', 'gugu'], '退回到私聊那份，而不是什么都不挂');
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }], '退回之后必须把兜底捡起来');
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()], '退回之后必须把兜底捡起来');
   // 退回 = 群会话又带着那几个工具了，而且**子会话会继承这一份** —— 这条 warn 必须说清楚。
   const warn = logs.find((l) => l.level === 'warn' && l.message.includes('gugu-lite'));
   assert.ok(warn !== undefined, '必须留下一条说清后果的 warn');
@@ -1531,7 +1694,7 @@ test('preset 一个都挂不上时：会话照常建立，退回 global 层（�
     '两次都失败要留下"回退到 global 层"的 warn',
   );
   // 两次都挂不上 → 什么都没挂上 → 兜底照旧生效（不知道跑的是哪份，就往安全那侧靠）。
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()]);
 });
 
 test('复用已有 agent：读 live preset 决定要不要兜底', async () => {
@@ -1559,17 +1722,17 @@ test('复用已有 agent：读 live preset 决定要不要兜底', async () => {
 
   const onLite = build('gugu-lite');
   await onLite.binder.ensure('qq-group-30000011');
-  assert.deepEqual(onLite.agent.restrictCalls, [], '已经在群那份上 → 不用兜');
+  assert.deepEqual(onLite.agent.restrictCalls, [alwaysDeniedCall()], '已经在群那份上 → 不用兜（常收那条照挂）');
 
   const onBase = build('gugu');
   await onBase.binder.ensure('qq-group-30000011');
-  assert.deepEqual(onBase.agent.restrictCalls, [{ deny: ['pwsh'] }], '跑的不是群那份 → 必须兜');
+  assert.deepEqual(onBase.agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()], '跑的不是群那份 → 必须兜');
 
   const unknown = build(undefined);
   await unknown.binder.ensure('qq-group-30000011');
   assert.deepEqual(
     unknown.agent.restrictCalls,
-    [{ deny: ['pwsh'] }],
+    [{ deny: ['pwsh'] }, alwaysDeniedCall()],
     '问不到就跑安全的那一侧（宁可多一条 warn，也别漏收口）',
   );
 });
@@ -1587,7 +1750,7 @@ test('groupAgentPreset 配成空串：群跟私聊挂同一份（急刹车开关
   await binder.ensure('qq-group-30000011');
 
   assert.deepEqual(presets.mounts, ['gugu'], '空串 = 不区分群和私聊');
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }], '这时候兜底必须还在');
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()], '这时候兜底必须还在');
 });
 
 test('groupAgentPreset 显式覆盖成别的 preset：兜底照旧叠（代码不知道它有没有那些工具）', async () => {
@@ -1606,7 +1769,7 @@ test('groupAgentPreset 显式覆盖成别的 preset：兜底照旧叠（代码�
   await binder.ensure('qq-group-30000011');
 
   assert.deepEqual(presets.mounts, ['gugu-noshell']);
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()]);
 });
 
 test('没有 agentPresets 服务时：不崩、不挂 preset，限制照旧', async () => {
@@ -1616,7 +1779,7 @@ test('没有 agentPresets 服务时：不崩、不挂 preset，限制照旧', as
 
   await binder.ensure('qq-group-30000011');
 
-  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }]);
+  assert.deepEqual(agent.restrictCalls, [{ deny: ['pwsh'] }, alwaysDeniedCall()]);
 });
 
 // ------------------------------------------ 「往 QQ 发东西」工具（`send_qq`，2026-10-18）
@@ -1945,7 +2108,11 @@ test('★ ensure ① 收养：有活着的 agent ⇒ 复用，create/resume 一�
   assert.equal(created.length, 0, 'agentLoop.createAgent 一次都不该调');
   assert.equal(resumed.length, 0, 'agentLoop.resume 一次都不该调');
   // 收养这条路**不经过 setup**，所以那套「复用要补一遍」的东西必须还在。
-  assert.deepEqual(liveAgent.restrictCalls, [{ deny: ['pwsh'] }], '收养路径也要补工具收口');
+  assert.deepEqual(
+    liveAgent.restrictCalls,
+    [{ deny: ['pwsh'] }, alwaysDeniedCall()],
+    '收养路径也要补工具收口',
+  );
   // 可观测性：走的是哪条一眼能看出来。
   const adoptLogs = logs.filter((l) => l.meta?.via === 'adopt');
   assert.equal(adoptLogs.length, 1, '收养要且只要一条 info（第二次命中缓存，不再打）');

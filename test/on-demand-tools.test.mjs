@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  ALWAYS_DENY_TOOLS,
   DEFAULT_ON_DEMAND_PREFIXES,
   ON_DEMAND_SECTION,
   ON_DEMAND_TOOL_NAME,
@@ -14,6 +15,8 @@ import {
 } from '../src/dsh/binding.mjs';
 
 function fakeAgentWithTools({ restrict, register, schemas = () => [], replyQueue = [] } = {}) {
+  // 每条 restrict 调用记 `released`：`partitionRestrictable()` 的探测是"调一次、立刻撤销"，
+  // 撤销掉的那层**不在生效**，不该算进 `restrictCalls`（否则探测会污染每条断言）。
   const calls = [];
   const registrations = [];
   const sections = [];
@@ -22,7 +25,19 @@ function fakeAgentWithTools({ restrict, register, schemas = () => [], replyQueue
     session: { header: { cwd: 'H:\\work' } },
     ctx: {
       tools: {
-        restrict(filter) { calls.push(filter); return () => {}; },
+        restrict(filter) {
+          const entry = { filter, released: false };
+          calls.push(entry);
+          if (restrict !== undefined) {
+            try {
+              restrict(filter);
+            } catch (error) {
+              entry.released = true;
+              throw error;
+            }
+          }
+          return () => { entry.released = true; };
+        },
         register(tool) { registrations.push(tool); return () => {}; },
         schemas(scope) { return typeof schemas === 'function' ? schemas(scope) : schemas; },
       },
@@ -31,7 +46,10 @@ function fakeAgentWithTools({ restrict, register, schemas = () => [], replyQueue
       },
     },
   };
-  agent.restrictCalls = calls;
+  Object.defineProperty(agent, 'restrictCalls', {
+    enumerable: true,
+    get: () => calls.filter((entry) => !entry.released).map((entry) => entry.filter),
+  });
   agent.registrations = registrations;
   agent.sections = sections;
   return agent;
@@ -142,13 +160,14 @@ test('load_tools：目录里没有的名字拒绝，不改变已加载状态', a
   assert.equal(agent.restrictCalls.length, before, '拒绝时不该重挂限制');
 });
 
-test('onDemandTools 配成 []：整套关掉（一个 restrict 都不发）', async () => {
+test('onDemandTools 配成 []：按需加载整套关掉（一条 on-demand restrict 都不发）', async () => {
   const agent = fakeAgentWithTools({ schemas: () => SAMPLE });
   const { binder } = binderWith(agent, { onDemandTools: [] });
 
   await binder.ensure('qq-private-30000001');
 
-  assert.deepEqual(agent.restrictCalls, []);
+  // 只剩「所有 QQ 会话都收」那一层（`ALWAYS_DENY_TOOLS`）；按需加载一条都不发。
+  assert.deepEqual(agent.restrictCalls, [{ deny: ALWAYS_DENY_TOOLS.slice() }]);
   assert.equal(agent.registrations.some((t) => t.name === ON_DEMAND_TOOL_NAME), false);
 });
 

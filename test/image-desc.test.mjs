@@ -552,9 +552,10 @@ test('★ 多帧 GIF：**按差异挑关键帧 → 拼成一张 PNG → 一次�
   assert.equal(describer.stats().sheets, 1);
 
   // 提示词要说清"这是同一个文件的几个画面"（⚠️ 但**不许**自己给这张图下"它在动"的结论）
+  // 帧数上限已经放到 16，但这张 GIF 只有 6 帧 ⇒ 读出几个画面就写几个，不硬凑
   const prompt = stream.calls[0].messages[0].content.find((c) => c.type === 'text').text;
-  assert.match(prompt, /同一个文件里按时间先后取出的 4 个画面/);
-  assert.match(prompt, /从左到右/);
+  assert.match(prompt, /同一个文件里按时间先后取出的 6 个画面/);
+  assert.match(prompt, /按顺序排成网格（从左到右、再从上到下/, '拼图改网格了，读法也要说清');
   assert.match(prompt, /不要用「动画」「动图」/, '禁词那句必须在提示词里');
   assert.doesNotMatch(prompt, /这是一张(动图|gif|动画)/i, '提示词自己不许下结论说"它在动"');
 });

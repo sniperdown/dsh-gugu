@@ -71,7 +71,7 @@
  *   ↓     找不到 → ② 下载原件（url；NapCat 的 &amp; 要反转义）
  * 算哈希（原件）→ ③ 查跨会话缓存表 → 命中即用（**连模型都不调**）
  *   ↓ 没命中
- *   ↓ ④ 是 GIF 且**帧数 > 1** → 按差异挑关键帧 → 横着拼成一张
+ *   ↓ ④ 是 GIF 且**帧数 > 1** → 按差异挑关键帧 → 拼成一张网格图
  *   ↓ ⑤ 识图（拼图 = 一次调用看完"从哪变到哪"；单帧 = 原样）
  * 生成描述 → ⑥ 写表（插件常驻，写盘；重启后还在）
  * ```
@@ -337,7 +337,7 @@ function describeInstruction(target, { frames = 0 } = {}) {
   if (frames > 1) {
     // ⚠️ 措辞只说"同一个文件的 N 个画面，按时间从左到右"——**这是事实**（我们就是这么拼的）。
     //    绝不说"这是一张动图"：那正是用户禁掉的说法。
-    parts.push(`这是同一个文件里按时间先后取出的 ${frames} 个画面，从左到右排列（不是 ${frames} 张不同的图）。`);
+    parts.push(`这是同一个文件里按时间先后取出的 ${frames} 个画面，按顺序排成网格（从左到右、再从上到下；不是 ${frames} 张不同的图）。`);
     parts.push('请把它们合成**一句**话：开头是什么样、中间变了什么、最后是什么样。');
   } else {
     parts.push(`用大约 ${target} 个字说清这张图里是什么（画面里的人物/物体、在做什么、周围场景，以及图上出现的文字）。`);
@@ -1422,7 +1422,7 @@ export function buildStickerInstruction({ frames = 0, maxDescChars = STICKER_DES
   // 与 describeInstruction 同一条规矩：只说"同一个文件的 N 个画面"（这是事实），
   // **绝不说"这是一张动图"**（那是用户禁掉的说法）。
   const intro = frames > 1
-    ? `这是同一个文件里按时间先后取出的 ${frames} 个画面，从左到右排列（不是 ${frames} 张不同的图）。`
+    ? `这是同一个文件里按时间先后取出的 ${frames} 个画面，按顺序排成网格（从左到右、再从上到下；不是 ${frames} 张不同的图）。`
     : '这是一张 QQ 表情包。';
   let text = g.prompt.trim() === '' ? DEFAULT_STICKER_PROMPT : g.prompt;
   // ⚠️ 用 split/join 而不是 replaceAll：替换串里以美元符号开头的序列

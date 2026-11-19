@@ -488,9 +488,12 @@ test('红线③：新消息照常派发（灌历史不该把引擎冻住）', as
   assert.equal(result.outcome, 'dispatched', '点名的新消息该照常回');
   assert.equal(h.gateway.stats.dispatched, 1);
   // 而且它写进转录之后，转录里**新消息在最前**（顺序没被灌历史打乱）
+  // ⚠️ 2026-11-10：转录现在也会收**她自己发出去的那句**（`fromSelf`），
+  //    所以"最后一条"不一定是这条入站消息 —— 顺序要对着**入站那串**看。
   const entries = h.engine.transcript('group:100').snapshot();
-  assert.equal(entries[entries.length - 1].messageId, 77);
-  assert.equal(entries.length, 21);
+  const inbound = entries.filter((m) => m?.fromSelf !== true);
+  assert.equal(inbound[inbound.length - 1].messageId, 77);
+  assert.equal(inbound.length, 21);
 });
 
 test('🔴 红线④：不在白名单的群**根本不拉**', async () => {

@@ -604,6 +604,16 @@ export function buildSnapshot({
          * 没有这段，一个坏掉的台账和"真的什么都没发"长得一模一样。
          */
         ledger: outboundLedgerStats(gateway?.outboundLedger),
+        /**
+         * **出站文本判据的状态**（2026-11-18）。
+         *
+         * 为什么必须进快照：这个设施**默认就是"可能一句话都没记"**的形态 ——
+         * 服务没起 / 超时 / 关掉，三种情况下台账里都只是"少了几行 `text-lint`"，
+         * 而**"没记"和"记了但都是 0 个可疑"在台账里长得一模一样**。
+         * 所以 `calls` / `ok` / `down` / `disabled` 这几个数必须当场能看到，
+         * 否则"判据到底在不在干活"又要靠翻文件猜。
+         */
+        textLint: textLintStats(gateway?.textLint),
       },
     },
     proactive: {
@@ -975,6 +985,49 @@ function outboundLedgerStats(ledger) {
         layer: s.last.layer ?? '',
         ok: s.last.ok === true,
       },
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * **出站文本判据**的计数（2026-11-18；取不到就 null —— 调试设施绝不拖垮主流程）。
+ *
+ * ⚠️ 四个结果计数**必须分开报**，因为它们的处置完全不同：
+ *
+ * | 字段 | 含义 | 该干什么 |
+ * |---|---|---|
+ * | `ok` | 服务正常答复了 | 正常 |
+ * | `down` | 连不上（服务没起） | 去起服务 |
+ * | `timeout` | 连上了但没在 `timeoutMs` 内回 | 查服务是不是被别的请求堵住了 |
+ * | `error` | 连上了但答了非 2xx / 不是 JSON | 查服务日志 |
+ *
+ * 只报一个"失败"合计的话，「服务没起」和「服务活着但坏了」分不开 ——
+ * 而这两件事一个要"去启动"、一个要"去修"，方向相反。
+ *
+ * `enabled:false` 时**一个请求都不会发**（`calls` 恒为 0），那是"明确关掉"，
+ * 不是"跑了但没结果"。
+ */
+function textLintStats(linter) {
+  try {
+    if (linter === null || linter === undefined || typeof linter.stats !== 'function') return null;
+    const s = linter.stats() ?? {};
+    return {
+      enabled: s.enabled === true,
+      url: typeof s.url === 'string' ? s.url : '',
+      timeoutMs: s.timeoutMs ?? 0,
+      calls: s.calls ?? 0,
+      ok: s.ok ?? 0,
+      down: s.down ?? 0,
+      timeout: s.timeout ?? 0,
+      error: s.error ?? 0,
+      /** 服务端自己量的判据耗时（毫秒）+ 最近一次报了几处。 */
+      lastMs: s.lastMs ?? null,
+      lastCount: s.lastCount ?? null,
+      /** 服务是不是本插件拉起的（默认 false = 外面起的/没起）。 */
+      spawned: s.spawned === true,
+      spawnFailed: s.spawnFailed === true,
     };
   } catch {
     return null;

@@ -317,6 +317,7 @@ export async function fetchHistory({
  * @param {number} [options.timeoutMs]
  * @param {AbortSignal} [options.signal]
  * @param {object} [options.nicknames] `QQ → 昵称` 表（见 {@link fetchHistory}）
+ * @param {(level: string, message: string, meta?: object) => void} [options.log] 只为那条"自述丢了"的 warn
  * @returns {Promise<object>} 结果摘要（**只含时间戳/条数，不含正文**）
  */
 export async function backfillChat({
@@ -328,6 +329,7 @@ export async function backfillChat({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   signal,
   nicknames = null,
+  log = () => {},
 } = {}) {
   if (engine === null || engine === undefined) throw new Error('backfill: 缺少 engine');
   const fetched = await fetchHistory({ chatId, call, count, selfId, timeoutMs, signal, nicknames });
@@ -347,7 +349,28 @@ export async function backfillChat({
   // === ① 转录（最近 N 条别人的话）===
   // ⚠️ 顺序：**先去重、再取最近 N 条**。反过来的话，已被看见的那条会白占一个名额。
   const fresh = fetched.messages.filter((m) => !(typeof m.messageId === 'number' && engine.seenIds.has(m.messageId)));
-  const restored = engine.transcript(chatId).restore(fresh.slice(-limit), { hardCap: limit });
+  const transcript = engine.transcript(chatId);
+  /**
+   * 灌之前数一下"她自己的发言"有几条（2026-11-18）。
+   *
+   * 为什么要有这一步：NapCat 历史里**她自己那几句被单独拆走**（`toSelfTarget` 只留
+   * 时间戳+正文，喂 `state.restoreContext`），所以"她说过什么"只能由本地记录负责
+   * （`engine.replayChatLog()` 在构造时先灌一遍）。这里只做一件事：**确认灌历史
+   * 没有把它们覆盖掉**。真丢了的表现是"重启后转录里一句 `我(小鲸鱼)` 都没有"。
+   *
+   * ⚠️ 只判"归零"，不判"变少"：`#trim` 是按条数挤旧的，灌进 20 条新的之后
+   * 最旧的几句话被挤出窗口是**正常**的（那不是丢数据，是窗口）。
+   */
+  const selfBefore = transcript.snapshot().filter((m) => m?.fromSelf === true).length;
+  const restored = transcript.restore(fresh.slice(-limit), { hardCap: limit });
+  const selfKept = transcript.snapshot().filter((m) => m?.fromSelf === true).length;
+  if (selfBefore > 0 && selfKept === 0) {
+    log('warn', '灌历史后本地的「我」发言全没了（本地聊天记录没接上？）', {
+      chatId,
+      before: selfBefore,
+      restored,
+    });
+  }
 
   // 记住这些 id：万一 NapCat 把同一条历史又作为实时事件补发一次，
   // `decide()` 那边会按 `duplicate` 直接跳过 —— 这是红线②的第二层保险。
@@ -361,6 +384,8 @@ export async function backfillChat({
     fetched: fetched.messages.length,
     restored,
     contextAt,
+    // 她自己的发言在灌完之后还剩几条（>0 = 本地记录接上了，见上面那段说明）。
+    selfKept,
     lastSelfWasQuestion: contextAt === null ? null : state.lastBotWasQuestion === true,
   };
 }
@@ -446,7 +471,7 @@ async function runAttempts({ engine, ids, call, count, selfId, timeoutMs, signal
   // **并发**拉（会话之间互不依赖），但每个会话自己 try/catch ⇒ 一个失败不影响别的。
   const results = await Promise.all(ids.map(async (chatId) => {
     try {
-      return await backfillChat({ engine, chatId, call, count, selfId, timeoutMs, signal, nicknames });
+      return await backfillChat({ engine, chatId, call, count, selfId, timeoutMs, signal, nicknames, log });
     } catch (error) {
       // 静默降级：这里唯一该发生的事就是记一行日志，然后当作"没这条会话"。
       log('info', `灌历史失败（忽略）${chatId}`, { error: String(error?.message ?? error) });
@@ -470,6 +495,7 @@ async function runAttempts({ engine, ids, call, count, selfId, timeoutMs, signal
         fetched: r.fetched,
         restored: r.restored,
         contextAt: r.contextAt,
+        selfKept: r.selfKept ?? 0,
         lastSelfWasQuestion: r.lastSelfWasQuestion === true,
         preview,
       });

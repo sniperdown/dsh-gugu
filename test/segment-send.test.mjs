@@ -28,6 +28,7 @@ import { SessionBinder, takeNewAssistantSegments } from '../src/dsh/binding.mjs'
 import { Gateway, OUTCOME } from '../src/dsh/gateway.mjs';
 import { Router, POLICY } from '../src/dsh/routing.mjs';
 import { createOutboundAllow } from '../src/dsh/outbound-allow.mjs';
+import { createAutoRelay } from '../src/dsh/auto-relay.mjs';
 import { ProactiveEngine } from '../src/proactive/engine.mjs';
 import { createOutboundLedger } from '../src/dsh/outbound-ledger.mjs';
 
@@ -107,19 +108,31 @@ test('takeNewAssistantSegments：没正文的助手消息（只调工具）不�
  *
  * `onIdle` 拿到 `{ messages, push }` 自己控制"这一轮里什么时候多出一条助手消息"，
  * 用它模拟"分几步写正文、中间隔一会儿"。
+ *
+ * `turn`（2026-11-16）：给这个假会话一个轮号 —— `followup` 时补一条 `turn/start`、
+ * 每 `push` 一段补一条 `assistant/message`，让"逐段泵认出本轮轮号"这条路真的能跑。
  */
-function makeBinder({ onIdle }) {
+function makeBinder({ onIdle, turn = 1 }) {
   const messages = [];
+  const events = [];
   const push = (text, id) => {
     messages.push({ id, role: 'assistant', content: [{ type: 'text', text }] });
+    events.push({
+      type: 'assistant/message',
+      data: { turn, step: messages.length, message: { id, role: 'assistant', content: [{ type: 'text', text }] } },
+    });
   };
   const agent = {
-    session: { deriveMessages: () => messages.map((m) => ({ ...m })) },
+    session: {
+      deriveMessages: () => messages.map((m) => ({ ...m })),
+      snapshotEvents: () => events.slice(),
+    },
     followup(payload) {
       messages.push({ id: payload.id, role: 'user', content: payload.content });
+      events.push({ type: 'turn/start', data: { turn } });
     },
     async whenIdle() {
-      await onIdle({ messages, push });
+      await onIdle({ messages, push, events });
     },
   };
   const ctx = {
@@ -132,7 +145,7 @@ function makeBinder({ onIdle }) {
       },
     },
   };
-  return { binder: new SessionBinder({ ctx }), messages };
+  return { binder: new SessionBinder({ ctx }), messages, events };
 }
 
 test('逐段外发：一轮三个 step 各一段 ⇒ 发三次，顺序对', async () => {
@@ -186,6 +199,80 @@ test('逐段外发：不给 onSegment 时行为不变（只返回最后一段）
   });
   const reply = await binder.runTurn({ sessionKey: 'qq-private-10003', prompt: '干活' });
   assert.equal(reply, '第二段');
+});
+
+// ============================================================ 轮归属（2026-11-16）
+
+test('轮归属：多段轮在**第一段落盘之前**就认出自己的轮号，并且只报一次', async () => {
+  // 这就是"归谁发"从按会话改成按轮的那一步：认得出轮号，网关才能在**同一个 turn**
+  // 上让路（而不是为整个会话让路）。认晚一点没关系，但必须在 `turn/end` 之前 ——
+  // 逐段泵每 200ms 扫一次，模型一轮跑几秒，所以第一段就报是稳的。
+  const { binder } = makeBinder({
+    turn: 2747,
+    onIdle: async ({ push }) => {
+      push('第一段', 'a1');
+      await delay(120);
+      push('第二段', 'a2');
+      await delay(120);
+      push('第三段', 'a3');
+    },
+  });
+  const turns = [];
+  const sent = [];
+  await binder.runTurn({
+    sessionKey: 'qq-private-10004',
+    prompt: '干活',
+    onTurn: (turn) => turns.push(turn),
+    onSegment: async (text, step) => {
+      sent.push({ text, step });
+    },
+  });
+  assert.deepEqual(turns, [2747], '只报一次，且报的是自己这一轮的轮号');
+  assert.deepEqual(sent.map((s) => s.text), ['第一段', '第二段', '第三段']);
+});
+
+test('轮归属：提示词还排在队里（宿主自己正跑别人的轮次）⇒ **不登记**', async () => {
+  // 2026-11-16 turn 2746 的形状：插件这一轮的提示词还没被收下，此时"开着的轮"是
+  // **宿主的** turn 2746。把那个号认成自己的 ⇒ 自动搬运会为别人的轮次让路 ⇒ 静默丢话。
+  const messages = [];
+  const events = [{ type: 'turn/start', data: { turn: 2746 } }];
+  const inbox = [];
+  const agent = {
+    session: {
+      deriveMessages: () => messages.map((m) => ({ ...m })),
+      snapshotEvents: () => events.slice(),
+    },
+    followup(payload) {
+      inbox.push(payload); // 排在队里，还没进 surface
+    },
+    async whenIdle() {
+      await delay(150); // 泵扫了几次：此刻开着的 turn 是 2746，但我的提示词还没被收下
+      // 2746 跑完了（宿主自己的一轮），我的提示词这才被收下 ⇒ 我的轮次是 2747。
+      events.push({ type: 'turn/end', data: { turn: 2746, reason: { kind: 'completed' } } });
+      messages.push({ id: inbox[0].id, role: 'user', content: inbox[0].content });
+      events.push({ type: 'turn/start', data: { turn: 2747 } });
+      await delay(400);
+      messages.push({ id: 'a1', role: 'assistant', content: [{ type: 'text', text: '我的第一段' }] });
+      events.push({
+        type: 'assistant/message',
+        data: { turn: 2747, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '我的第一段' }] } },
+      });
+    },
+  };
+  const ctx = { agents: { async create() { return { agent, async dispose() {} }; }, async resume() { return { agent, async dispose() {} }; } } };
+  const binder = new SessionBinder({ ctx });
+  const turns = [];
+  const sent = [];
+  await binder.runTurn({
+    sessionKey: 'qq-private-10005',
+    prompt: '干活',
+    onTurn: (turn) => turns.push(turn),
+    onSegment: async (text) => {
+      sent.push(text);
+    },
+  });
+  assert.deepEqual(turns, [2747], '只认自己被收下之后的那一轮，绝不认排队时开着的 2746');
+  assert.deepEqual(sent, ['我的第一段']);
 });
 
 // ============================================================ 网关：发送
@@ -257,6 +344,75 @@ function dmEvent(overrides = {}) {
     ...overrides,
   };
 }
+
+test('端到端：多段轮每条只出现一次（网关 → 绑定 → 自动搬运真的接上）', async () => {
+  // 这一条钉的是**接线**，不是单点：网关把 `onTurn` 交给 `asResponder()`、绑定层的逐段泵
+  // 认出轮号再回写给网关 —— 漏任何一环，自动搬运在 `turn/end` 都会把整串再搬一遍，
+  // 而整串 ≠ 单段，`#sendOne` 的「同文短窗」拦不住（这正是 2026-11-16 那个 bug 的孪生风险）。
+  const TURN = 2747;
+  const KEY = 'qq-private-10000001';
+  const messages = [];
+  const events = [];
+  const delays = () => new Promise((r) => setTimeout(r, 350));
+  const agent = {
+    session: {
+      deriveMessages: () => messages.map((m) => ({ ...m })),
+      snapshotEvents: () => events.slice(),
+    },
+    followup(payload) {
+      messages.push({ id: payload.id, role: 'user', content: payload.content });
+      events.push({ type: 'turn/start', data: { turn: TURN } });
+    },
+    async whenIdle() {
+      const say = (text, id) => {
+        messages.push({ id, role: 'assistant', content: [{ type: 'text', text }] });
+        events.push({
+          type: 'assistant/message',
+          data: { turn: TURN, step: messages.length, message: { id, role: 'assistant', content: [{ type: 'text', text }] } },
+        });
+      };
+      say('第一段', 'a1');
+      await delays();
+      owners.push(gateway.turnOwnerOf(KEY));
+      say('第二段', 'a2');
+      await delays();
+      say('第三段', 'a3');
+      await delays();
+      // 轮末：宿主在这里同步发 `turn/end`（所以自动搬运看到的牌子必须**在这一刻就有效**）
+      events.push({ type: 'turn/end', data: { turn: TURN, reason: { kind: 'completed' } } });
+      relayResults.push(await relay.observe({ id: KEY, snapshotEvents: () => events.slice() }, { type: 'turn/end', data: { turn: TURN } }));
+    },
+  };
+  const ctx = {
+    agents: {
+      async create() {
+        return { agent, async dispose() {} };
+      },
+      async resume() {
+        return { agent, async dispose() {} };
+      },
+    },
+  };
+  const binder = new SessionBinder({ ctx });
+  const owners = [];
+  const relayResults = [];
+  let relay = null;
+  let gateway = null;
+  const h = harness({ responder: binder.asResponder() });
+  gateway = h.gateway;
+  relay = createAutoRelay({ gateway });
+
+  const result = await gateway.handleEvent(dmEvent());
+
+  assert.equal(result.outcome, OUTCOME.DISPATCHED);
+  assert.deepEqual(owners, [TURN], '泵在第一段之后就认出轮号，并登记到网关（`asResponder` 没漏转发 onTurn）');
+  assert.deepEqual(relayResults, ['in-flight'], '`turn/end` 时自动搬运必须让路');
+  assert.deepEqual(
+    h.transport.sent.map((s) => s.message),
+    ['第一段', '第二段', '第三段'],
+    '三段各一条：既没少发，也没有"整串"那第四条',
+  );
+});
 
 test('网关：一轮三段 ⇒ QQ 上三条、顺序对、轮末不重复发', async () => {
   const h = harness({

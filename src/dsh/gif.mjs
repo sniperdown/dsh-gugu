@@ -1,5 +1,5 @@
 /**
- * GIF：**自己把帧解出来**，挑出关键帧，横着拼成一张图。
+ * GIF：**自己把帧解出来**，挑出关键帧，拼成一张网格图。
  *
  * ## 为什么要在插件里手写一个 GIF 解码器
  *
@@ -21,7 +21,7 @@
  * ```
  * 第一趟：逐帧解 → 立刻缩成 48×48 的缩略图（只留缩略图，全尺寸的丢掉）→ 算相邻帧差异
  *         ↓ 选关键帧（首帧 + 末帧 + 变化最大的若干帧）
- * 第二趟：再解一遍，**只留选中的那几帧**，缩到拼图尺寸 → 横着拼 → 编码成 PNG
+ * 第二趟：再解一遍，**只留选中的那几帧**，缩到拼图尺寸 → 拼成网格 → 编码成 PNG
  * ```
  *
  * 两趟 = 两倍 CPU（GIF 的 LZW 很快，几毫秒到几十毫秒），换来的是**内存与帧数无关**：
@@ -58,22 +58,38 @@ const GIF_SIGNATURE = [0x47, 0x49, 0x46, 0x38];
 /**
  * 拼图里放几帧。
  *
- * **为什么是 4**（用户给的范围是 2~6，要我说依据）：
+ * **2026-11-17 从 4 改成 16**，因为实测把当初的成本假设推翻了：
  *
- * - **2 帧不够**：只能给"开始/结束"，一段有转折的 GIF（铺垫→反转→笑点）会被压成两点，
- *   而"从哪变到哪"恰恰要靠中间那一跳才说得清；
- * - **6 帧太贵且太小**：横向拼 6 帧时，为了不超 `SHEET_MAX_WIDTH`，每帧只能分到 200px 上下，
- *   表情细节（笑点常在那）糊掉；而且视觉 token 与像素面积成正比，6 帧不会比 4 帧便宜多少；
- * - **4 帧 = 首 + 末 + 2 个最大变化**：正好覆盖"起、转、合"，每帧还能分到 300~500px。
+ * - **图片 token 有封顶**：provider 上限 1024/图，平台实测值 995，约 1316×1316 起就不再涨。
+ *   所以 4 帧横拼（1224×300，实测 **251**）和 4×4 网格（1400×1400，实测 **995**）
+ *   之间差的只是一个可以忽略的绝对值（约 ¥0.00003/张）。
+ * - **网格让每帧更大，不是更小**：4 帧横拼每帧 300×300；4×4 网格每帧 344×344。
+ *   帧数 ×4、单帧还更大 —— 旧注释里"帧多了会糊"的顾虑在封顶面前不成立。
  *
- * 成本参考：4 帧 @ 300×300 拼成 1224×300 ≈ **470 token**；源图较大时被
- * {@link SHEET_MAX_WIDTH} 压到 1400 宽 ≈ **550 token**。相比"整条描述只花一次调用"，
- * 这是它的 1.5 倍上下 —— 而它换来的是**唯一能看到动态的机会**（见模块头）。
+ * ⚠️ 旧注释里「4 帧 ≈ 470 token」是**估高的**，实测 251。别再按像素面积线性外推：
+ * 封顶之前那段确实是线性的，但 1400 见方之后平掉了，外推会算出 2500+ 这种假数。
  */
-export const DEFAULT_SHEET_FRAMES = 4;
+export const DEFAULT_SHEET_FRAMES = 16;
+
+/**
+ * 网格列数（16 帧 = 4×4）。
+ *
+ * 实际列数取 `min(SHEET_COLUMNS, 帧数)`：帧数不足 4 时退化成**横排**，
+ * 所以 `maxFrames: 4` 这类老调用拼出来的仍是一条横条，行为逐字节不变。
+ */
+export const SHEET_COLUMNS = 4;
 
 /** 拼图总宽上限（像素）。超了就把每帧一起缩小，免得被下游按长边再压一次、细节全糊。 */
 export const SHEET_MAX_WIDTH = 1400;
+
+/**
+ * 拼图总高上限（像素）。
+ *
+ * 改成网格之后才有这个约束：横条只有一行，高就等于单帧高；4 行叠起来
+ * 可能到几千像素（竖长条的 GIF），既浪费 token 又会被下游按长边压回去。
+ * 和 `SHEET_MAX_WIDTH` 取同一个数，保证拼图落在 1400×1400 以内。
+ */
+export const SHEET_MAX_HEIGHT = 1400;
 
 /** 单帧在拼图里的最大宽度。小图**不放大**（放大只是把同样的信息画得更大，反而糊）。 */
 export const SHEET_MAX_FRAME_WIDTH = 512;
@@ -616,19 +632,37 @@ export function selectKeyFrames(frames, { count = DEFAULT_SHEET_FRAMES } = {}) {
 }
 
 /**
- * 横向拼成一张图。
+ * 把若干帧拼成一张图：`columns` 给几列就排几列。
+ *
+ * `columns` 缺省（或 ≤0）= 全部横排，也就是改成网格之前的老行为 ——
+ * 老调用点一个字都不用改。
  *
  * @param {Array<{rgba: Uint8Array, width: number, height: number}>} frames 已经缩到目标尺寸的帧
  * @param {object} [options]
  * @param {number} [options.gap]
  * @param {number} [options.background] 0~255 灰度，默认白
+ * @param {number} [options.columns] 列数；0 = 全横排
  * @returns {{width: number, height: number, rgba: Uint8Array}|null}
  */
-export function composeSheet(frames, { gap = SHEET_GAP, background = 255 } = {}) {
+export function composeSheet(frames, { gap = SHEET_GAP, background = 255, columns = 0 } = {}) {
   const list = (Array.isArray(frames) ? frames : []).filter((f) => f && f.rgba && f.width > 0 && f.height > 0);
   if (list.length === 0) return null;
-  const height = Math.max(...list.map((f) => f.height));
-  const width = list.reduce((sum, f) => sum + f.width, 0) + gap * (list.length - 1);
+
+  const cols = Number.isInteger(columns) && columns > 0 ? Math.min(columns, list.length) : list.length;
+  const rows = Math.ceil(list.length / cols);
+
+  // 列宽取该列最宽的那帧、行高取该行最高的那帧 —— 帧尺寸不一致时也不会被裁掉
+  const colWidths = new Array(cols).fill(0);
+  const rowHeights = new Array(rows).fill(0);
+  list.forEach((frame, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    if (frame.width > colWidths[col]) colWidths[col] = frame.width;
+    if (frame.height > rowHeights[row]) rowHeights[row] = frame.height;
+  });
+
+  const width = colWidths.reduce((sum, w) => sum + w, 0) + gap * (cols - 1);
+  const height = rowHeights.reduce((sum, h) => sum + h, 0) + gap * (rows - 1);
   const rgba = new Uint8Array(width * height * 4);
   for (let i = 0; i < rgba.length; i += 4) {
     rgba[i] = background;
@@ -636,14 +670,29 @@ export function composeSheet(frames, { gap = SHEET_GAP, background = 255 } = {})
     rgba[i + 2] = background;
     rgba[i + 3] = 255;
   }
-  let x = 0;
-  for (const frame of list) {
-    // 竖直居中：帧高不一致时（理论上不会，画布是统一的）也不至于贴顶
-    const y = Math.floor((height - frame.height) / 2);
-    for (let row = 0; row < frame.height; row += 1) {
-      for (let col = 0; col < frame.width; col += 1) {
-        const srcAt = (row * frame.width + col) * 4;
-        const dstAt = ((y + row) * width + (x + col)) * 4;
+
+  // 每一列的左边界 / 每一行的上边界
+  const colX = [];
+  for (let col = 0, x = 0; col < cols; col += 1) {
+    colX.push(x);
+    x += colWidths[col] + gap;
+  }
+  const rowY = [];
+  for (let row = 0, y = 0; row < rows; row += 1) {
+    rowY.push(y);
+    y += rowHeights[row] + gap;
+  }
+
+  list.forEach((frame, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    // 在格子里居中（帧高不一致时也不至于贴顶）
+    const x = colX[col] + Math.floor((colWidths[col] - frame.width) / 2);
+    const y = rowY[row] + Math.floor((rowHeights[row] - frame.height) / 2);
+    for (let r = 0; r < frame.height; r += 1) {
+      for (let c = 0; c < frame.width; c += 1) {
+        const srcAt = (r * frame.width + c) * 4;
+        const dstAt = ((y + r) * width + (x + c)) * 4;
         // ⚠️ **要和背景合成**，不能直接覆盖：GIF 到处是透明区（透明背景、disposal=2 擦过的区域），
         // 直接覆盖的话那些地方会露出 RGBA 里的 0（黑块）。
         const alpha = frame.rgba[srcAt + 3];
@@ -660,8 +709,7 @@ export function composeSheet(frames, { gap = SHEET_GAP, background = 255 } = {})
         // alpha === 0：保留背景色
       }
     }
-    x += frame.width + gap;
-  }
+  });
   return { width, height, rgba };
 }
 
@@ -792,13 +840,19 @@ export function buildGifSheet(bytes, {
 
     // ── 第二趟：只留选中的那几帧，缩到拼图尺寸 ──
     const want = new Set(indices);
+    // 列数：不足 SHEET_COLUMNS 就退化成全横排（`maxFrames: 4` 那类老调用拼出来的还是横条）
+    const cols = Math.min(SHEET_COLUMNS, indices.length);
+    const rows = Math.ceil(indices.length / cols);
+    // 宽度方向：每帧平分可用宽度
+    const byWidth = Math.floor((maxWidth - gap * (cols - 1)) / cols);
+    // 高度方向：帧高 ≈ 帧宽 × 画布宽高比，叠 rows 行别超 SHEET_MAX_HEIGHT
+    const aspect = info.width > 0 ? info.height / info.width : 1;
+    const byHeight = aspect > 0
+      ? Math.floor((SHEET_MAX_HEIGHT - gap * (rows - 1)) / (rows * aspect))
+      : SHEET_MAX_FRAME_WIDTH;
     const perFrame = Math.max(
       32,
-      Math.min(
-        SHEET_MAX_FRAME_WIDTH,
-        info.width,
-        Math.floor((maxWidth - gap * (indices.length - 1)) / indices.length),
-      ),
+      Math.min(SHEET_MAX_FRAME_WIDTH, info.width, byWidth, byHeight),
     );
     const kept = new Map();
     decodeGifFrames(bytes, {
@@ -817,7 +871,7 @@ export function buildGifSheet(bytes, {
 
     const ordered = indices.map((i) => kept.get(i)).filter(Boolean);
     if (ordered.length === 0) return { ok: false, reason: 'decode-failed' };
-    const sheet = composeSheet(ordered, { gap });
+    const sheet = composeSheet(ordered, { gap, columns: cols });
     if (sheet === null) return { ok: false, reason: 'compose-failed' };
 
     const avgDiff = diffs.length > 0 ? diffs.reduce((a, b) => a + b, 0) / diffs.length : 0;
