@@ -161,7 +161,9 @@ test('★ 开关与"走本地还是走云"无关：门控选本地时 true 一�
 test('★ 配置页：`vision_gate.enableThinking` 在白名单里，落在 qq-gugu.vision.toml，能读能写', () => {
   const field = CONFIG_FIELDS.find((item) => item.key === 'vision_gate.enableThinking');
   assert.ok(field, '不白名单 = 页面上根本看不见这个开关');
-  assert.equal(field.label, '识图 · 开思考');
+  // 2026-11-09：显示名从「识图 · 开思考」改成「识图 · 思考档」—— 这个键是"强制关 /
+  // 跟随模型默认"两档，叫「开思考」会让勾选框读起来像"勾上反而是关"（用户原话）。
+  assert.equal(field.label, '识图 · 思考档');
   assert.equal(field.section, 'vision_gate');
   assert.deepEqual(field.sectionPath, ['vision_gate'], '写回的是 [vision_gate] 段（不是 [vision_gate.cloud] 之类）');
   assert.equal(field.tomlKey, 'enableThinking');

@@ -13,7 +13,7 @@ npm run test:isolated   # 逐文件独立进程（node --test + glob），非沙
 - **别用裸 `node --test`**：受限沙箱禁 named pipe，子进程抓管道会 `EPERM`，
   表现是"每个文件正好 1 条失败"的假红。
 - `npm test` 自己 readdir 扫 `test/*.test.mjs`，**新增测试文件自动跑到**，不用维护清单。
-- 基线：**114 个文件 / 2411 条**（`pass 2409` + `skipped 2`，**0 fail，退出码 0**）。
+- 基线：**116 个文件 / 2422 条**（`pass 2420` + `skipped 2`，**0 fail，退出码 0**）。
 - 那 2 条 skip 是**故意的、依赖真机文件**的用例：`sticker-recognize` 与 `sticker-tag-format`
   各有一条要读真 `<DSH_HOME>/profiles/<profile>/qq-gugu.toml`；没这个文件就 skip，
   **不是漏跑**。真要跑就先配好那份 toml。
@@ -98,7 +98,7 @@ src/dsh/paths.mjs          插件文件路径的统一解析
 web/ + client.js           设置页（浏览器半 / 宿主半），零构建
 tools/                     开发与诊断脚本（bootstrap 体检、健康检查、回放…）
 docs/                      设计与部署文档
-test/                      测试（114 个文件）
+test/                      测试（116 个文件）
 ```
 
 ## 八、提交前

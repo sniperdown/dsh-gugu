@@ -185,7 +185,22 @@ const RAW_CONFIG_FIELDS = [
   //    ⚠️ 和下面 `sticker_gate.enableThinking` **不是同一个键**：那个管「认」（表情包审核），
   //    这个管「转发里那张图配一句话」。两个都叫 enableThinking、都默认 false，但落在
   //    两个文件（`qq-gugu.vision.toml` / `qq-gugu.sticker.toml`）的两段里 —— 别照着改串了。
-  { key: 'vision_gate.enableThinking', label: '识图 · 开思考', section: 'vision_gate', sectionPath: ['vision_gate'], tomlKey: 'enableThinking', type: 'bool', effectivePath: ['vision', 'enableThinking'], default: false },
+  // ⚠️ 2026-11-09：**名字不能说「开思考」**。这个键不是"开 / 关思考"，是"强制关 / 跟随默认"
+  //    两档（`false` = 发 `reasoningEffort: 'off'`，`true` = 根本不发这个字段）——
+  //    勾选框配一个「开思考」曾经让用户以为"勾上反而是关"。名字说归属（识图）+ 说的是哪一档。
+  {
+    key: 'vision_gate.enableThinking',
+    label: '识图 · 思考档',
+    section: 'vision_gate',
+    sectionPath: ['vision_gate'],
+    tomlKey: 'enableThinking',
+    type: 'bool',
+    effectivePath: ['vision', 'enableThinking'],
+    default: false,
+    onText: '跟随模型默认',
+    offText: '关（强制不发思考）',
+    hint: '「跟随模型默认」= 请求里完全不发 reasoningEffort，由 provider 用它自己的默认档；「强制不发思考」= 明确发 reasoningEffort: off。',
+  },
 
   // ── 表情包审核（qq-gugu.sticker.toml） ──
   // ⚠️ `prompt` 暂时不在这里：提示词文本的收拢是下一批，先只把"模型与阈值"搬上页。
@@ -198,7 +213,21 @@ const RAW_CONFIG_FIELDS = [
   { key: 'sticker_gate.funnyMin', label: '有趣下限（< 拒）', section: 'sticker_gate', sectionPath: ['sticker_gate'], tomlKey: 'funnyMin', type: 'number', effectivePath: ['sticker', 'funnyMin'], default: 3 },
   { key: 'sticker_gate.captionMaxChars', label: '配文字数上限', section: 'sticker_gate', sectionPath: ['sticker_gate'], tomlKey: 'captionMaxChars', type: 'number', effectivePath: ['sticker', 'captionMaxChars'], default: 120 },
   { key: 'sticker_gate.maxTokens', label: '审核输出上限', section: 'sticker_gate', sectionPath: ['sticker_gate'], tomlKey: 'maxTokens', type: 'number', effectivePath: ['sticker', 'maxTokens'], default: 4000 },
-  { key: 'sticker_gate.enableThinking', label: '开思考', section: 'sticker_gate', sectionPath: ['sticker_gate'], tomlKey: 'enableThinking', type: 'bool', effectivePath: ['sticker', 'enableThinking'], default: false },
+  // ⚠️ 同上、**但是另一个键**（`qq-gugu.sticker.toml` 的 `[sticker_gate]`，管「认」这条路）。
+  //    两档语义与 `vision_gate.enableThinking` 一致，名字必须带自己的归属，别混。
+  {
+    key: 'sticker_gate.enableThinking',
+    label: '表情包审核 · 思考档',
+    section: 'sticker_gate',
+    sectionPath: ['sticker_gate'],
+    tomlKey: 'enableThinking',
+    type: 'bool',
+    effectivePath: ['sticker', 'enableThinking'],
+    default: false,
+    onText: '跟随模型默认',
+    offText: '关（强制不发思考）',
+    hint: '「跟随模型默认」= 请求里完全不发 reasoningEffort，由 provider 用它自己的默认档；「强制不发思考」= 明确发 reasoningEffort: off。',
+  },
   { key: 'sticker_audit.enabled', label: '审核留样', section: 'sticker_audit', sectionPath: ['sticker_audit'], tomlKey: 'enabled', type: 'bool', effectivePath: ['stickerAudit', 'enabled'], default: true },
   { key: 'sticker_audit.dir', label: '留样目录', section: 'sticker_audit', sectionPath: ['sticker_audit'], tomlKey: 'dir', type: 'text', effectivePath: ['stickerAudit', 'dir'], default: '' },
   { key: 'sticker_audit.maxFiles', label: '留样张数上限', section: 'sticker_audit', sectionPath: ['sticker_audit'], tomlKey: 'maxFiles', type: 'number', effectivePath: ['stickerAudit', 'maxFiles'], default: 200 },

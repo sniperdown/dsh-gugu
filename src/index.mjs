@@ -105,6 +105,10 @@ import { createGaugeLog, DEFAULT_GAUGE_LOG_MAX_BYTES } from './dsh/gauge-log.mjs
 import { createTopicStore } from './dsh/topics.mjs';
 import { createTopicExtractor } from './dsh/topics-extract.mjs';
 import { buildSnapshot, createDebugWriter, defaultDebugPath } from './dsh/debug-snapshot.mjs';
+// 定时器代际登记（2026-11-15）：插件热重载时 `apply` 可能在同一进程里被重复调用，
+// 而不一定伴随一次完整 dispose —— 三个 `setInterval` 会叠加出多套泵，每套闭包都把
+// 那一代实例钉在内存里，最终把宿主堆推到上限。这里把"这一代"的定时器登记起来。
+import { startGeneration, endGeneration } from './dsh/lifecycle.mjs';
 import { createFreeTime } from './dsh/free-time.mjs';
 // 唤醒前的整屏截图（2026-10-21）：整个虚拟桌面（主屏 + 副屏拼成一张）。
 import { captureVirtualDesktop } from './dsh/screen-capture.mjs';
@@ -2126,6 +2130,11 @@ export function apply(ctx, rawConfig = {}) {
   gateway.engine = engine;
   gateway.attach();
 
+  // 定时器按"代"登记（2026-11-15）：重复 apply 时先清掉上一代遗留，避免叠加
+  // 多个泵实例（崩溃日志里话题泵的"连续失败"累计到 1140 次，即约 4 代同时在跑）。
+  // 下面三个 `setInterval`（回想泵 / 转录落盘 / 话题影子）都要 `timerGen.register(...)`。
+  const timerGen = startGeneration({ log });
+
   // ===== 聊天回想泵（M1，2026-11-04）=====
   //
   // 转录是 60 条环形缓冲，第 61 条进来时第 1 条就被挤掉了（`Transcript.dropped`）。
@@ -2172,6 +2181,7 @@ export function apply(ctx, rawConfig = {}) {
     });
   }, RECALL_PUMP_MS);
   if (typeof recallTimer?.unref === 'function') recallTimer.unref();
+  timerGen.register(recallTimer);
 
   // ===== 转录落盘（M1b，2026-11-05）=====
   //
@@ -2205,6 +2215,7 @@ export function apply(ctx, rawConfig = {}) {
     }
   }, TRANSCRIPT_SAVE_MS);
   if (typeof transcriptTimer?.unref === 'function') transcriptTimer.unref();
+  timerGen.register(transcriptTimer);
 
   // ===== 话题状态影子泵（M3，2026-11-05）=====
   //
@@ -2257,6 +2268,7 @@ export function apply(ctx, rawConfig = {}) {
     });
   }, TOPIC_PUMP_MS);
   if (typeof topicTimer?.unref === 'function') topicTimer.unref();
+  timerGen.register(topicTimer);
 
   // ===== 开始灌历史（2026-10-13）=====
   //
@@ -3055,6 +3067,15 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(
     () => () => {
       gateway.stop();
+      // 先摘定时器（2026-11-15）：后面任何 stop 抛异常都不影响这一条。
+      // 传 `timerGen.generation`：换代之后旧实例迟到的 dispose 不能清掉新一代的定时器。
+      try {
+        endGeneration(log, timerGen.generation);
+      } catch (error) {
+        log('warn', '关闭定时器失败（忽略）', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       // **定时器也要显式清**，不能指望"对象被丢弃、定时器就没了"。
       //
       // 2026-10-04 排查长驻资源时补的。两处之前都漏了：
