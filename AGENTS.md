@@ -13,13 +13,20 @@ npm run test:isolated   # 逐文件独立进程（node --test + glob），非沙
 - **别用裸 `node --test`**：受限沙箱禁 named pipe，子进程抓管道会 `EPERM`，
   表现是"每个文件正好 1 条失败"的假红。
 - `npm test` 自己 readdir 扫 `test/*.test.mjs`，**新增测试文件自动跑到**，不用维护清单。
-- 基线：**114 个文件 / 2411 条**。当前已知长期红 3 条，都是**环境/部署相关**、
-  与改动无关，别当成自己弄坏的：
-  - `markdown-outbound` 的「图片段一个字节都不碰」；
-  - `persona-rules` 的「五段硬规矩必须真的在人格里」（要一份真机的 `qq-gugu.toml`）；
-  - `group-names` 的「`defaultGroupNameTablePath` 没有 DSH_HOME ⇒ 本部署写死目录」
-    （钉的是某次部署的实际路径）。
-  除这三条以外应当全绿。
+- 基线：**114 个文件 / 2411 条**（`pass 2409` + `skipped 2`，**0 fail，退出码 0**）。
+- 那 2 条 skip 是**故意的、依赖真机文件**的用例：`sticker-recognize` 与 `sticker-tag-format`
+  各有一条要读真 `<DSH_HOME>/profiles/<profile>/qq-gugu.toml`；没这个文件就 skip，
+  **不是漏跑**。真要跑就先配好那份 toml。
+- 2026-11-19 之前这里长期挂着 3 条红，已经全部处理掉：
+  - `markdown-outbound`「图片段一个字节都不碰」→ **断言过时**：文本段早已是
+    `{type:'text', data:{text}}` 的规范形状（扁平形状进 `send_msg` 会 retcode 200），
+    断言随之改对；
+  - `persona-rules`「五段硬规矩」→ **口径变了**：`【别乱转交】` 是使用者 2026-11-09
+    有意删掉的（转交那套功能本仓库不带），必检清单改成四段，并加断言要求它也在
+    toml 的 `rules` 里；
+  - `group-names` 的 `defaultGroupNameTablePath` → **断言依赖环境**：它拿
+    import 时按 `process.env` 算出的常量去比一个空 env 推出来的路径，机器上有
+    `DSH_HOME` 时必然不等（假红）。改成跟同一个空 env 的回退常量比。
 - 判绿：**条数对得上基线且退出码为 0**。
 
 ## 二、改完代码 / 配置，它真的生效了吗
@@ -96,7 +103,7 @@ test/                      测试（114 个文件）
 
 ## 八、提交前
 
-- `npm test` 绿（除上面那三条已知红）。
+- `npm test` 绿：**0 fail、退出码 0**（那 2 条 skip 是上面说过的真机依赖用例）。
 - **别把运行期产物带进提交**：`.gitignore` 里逐条写了理由；尤其注意
   `test/.tmp-*/`（测试会往里写抓下来的图片）与真实 `qq-gugu.toml`。
 - 新增配置字段要同时改：`src/dsh/config-fields.mjs`（设置页）、

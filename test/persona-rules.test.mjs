@@ -2,7 +2,7 @@
  * 人格拼装的两条不变式 —— 防的是 2026-10-08 那个"规矩静默失效"复发。
  *
  * 背景：`cordis.patch.yml` 里两个 preset 的 `persona.config.prefix` 各 68 行，
- * 含五段硬规矩（干活的规矩 / 别乱转交 / 在 QQ 上问问题的方式 / 动手前先问 /
+ * 当初含五段硬规矩（干活的规矩 / 别乱转交 / 在 QQ 上问问题的方式 / 动手前先问 /
  * 被沙箱拒绝就是拒绝）。而 `binding.mjs` 在 agent 作用域用【同名 section】
  * （`deployment:persona-prefix`）遮蔽了它 —— `dsh-system-prompt` 的 `section()`
  * 文档写着 "A scoped section shadows a global section with the same name"。
@@ -12,7 +12,10 @@
  * 这个文件钉住两件事：
  *   ① rules 字段真的会被拼进人格（否则搬家等于白搬）
  *   ② 没写 rules 时行为与从前完全一致（不接受"加了字段导致所有人都多一段空标题"）
- *   ③ 如果跑得到用户的 toml，就真的断言那五段硬规矩在里面（最贴近现实的一条）
+ *   ③ 如果跑得到用户的 toml，就真的断言那四段硬规矩在里面（最贴近现实的一条）
+ *
+ * ⚠️ 2026-11-09：`【别乱转交】` 这一段**是用户自己有意删掉的**（不是搬丢），
+ * 所以从必检清单里移除，别再补回去；把它当成"曾经要求过"的历史规矩。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -77,15 +80,15 @@ function locateToml() {
 
 const tomlPath = locateToml();
 
-test('真机上：那五段硬规矩必须真的在人格里（防"搬家搬丢了"）', { skip: tomlPath === null ? '没找到 qq-gugu.toml' : undefined }, () => {
+test('真机上：那四段硬规矩必须真的在人格里（防"搬家搬丢了"）', { skip: tomlPath === null ? '没找到 qq-gugu.toml' : undefined }, () => {
   const doc = parseToml(readFileSync(tomlPath, 'utf8'));
   const persona = loadPersona({ tomlPath });
   assert.ok(persona.length > 0, 'loadPersona 不该返回空');
 
-  // 五段 —— 每一段的存在都对应一次"用户明确要求/批评过"或"保命"
+  // 四段 —— 每一段的存在都对应一次"用户明确要求/批评过"或"保命"。
+  // 【别乱转交】不在这里：用户 2026-11-09 确认那段是他有意删的，别再补。
   const MUST = [
     '【干活的规矩】',
-    '【别乱转交】',
     '【在 QQ 上问问题的方式】',
     '【动手前先问】',
     '【被沙箱拒绝就是拒绝】',

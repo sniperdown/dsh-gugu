@@ -28,7 +28,11 @@
  * 测试会 `apply()` 整个插件，而且 Windows 的 `SO_REUSEADDR` 让"撞端口"防不住重复）。
  * 默认形态是**纯客户端**：服务在不在只影响台账里有没有 `text-lint` 行。
  *
- * 要插件自己管生命周期就开 `spawn: true`（生产走 `QQ_TEXT_LINT_SPAWN=1`），那时：
+ * 要插件自己管生命周期就开 `spawn: true`（生产走 `QQ_TEXT_LINT_SPAWN=1`），那时
+ * **必须同时显式给 `script`**（`config.script` 或 `QQ_TEXT_LINT_SCRIPT`）——
+ * 这个仓库不带那个 Python 服务，也不再提供默认路径（留一个假路径只会让人以为开箱能用）。
+ * 开了 spawn 却没给 script ⇒ 只记一条 warn、不起服务，发送完全不受影响。
+ * 给了之后：
  *
  * - 子进程带 `--parent-stdin`，父进程握住它的 stdin 管道；**父进程一死管道 EOF ⇒ 它自己退出**
  *   （Windows 上父进程死掉不会自动带走子进程，这是防孤儿的那道保险）。
@@ -67,9 +71,15 @@ export const DEFAULT_TEXT_LINT_URL = 'http://127.0.0.1:8791';
 export const DEFAULT_TEXT_LINT_PYTHON =
   '<DSH_HOME>\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe';
 
-/** 服务脚本路径（工作区里，跟着第一轮实验的目录走）。 */
-export const DEFAULT_TEXT_LINT_SCRIPT =
-  '<workspace>\\shared\\2026-11-18-困惑度校验\\vocab-service\\server.py';
+/**
+ * 服务脚本路径：**没有默认值**（2026-11-19）。
+ *
+ * 这一版把原来那条"工作区里跟着实验目录走"的默认路径删掉了 —— 那是个**只有某个部署
+ * 才成立**的假路径，留着只会让人以为开箱能用，实际表现是"spawn 一开就报脚本不存在"。
+ *
+ * ⇒ 要 `spawn: true` 就必须**显式**给 `config.script`（或 `QQ_TEXT_LINT_SCRIPT`）；
+ *   不给就不起服务，并在日志里说清为什么（见 `start()`）。
+ */
 
 /**
  * 兜底默认值。
@@ -179,7 +189,7 @@ export function createTextLinter({
     spawn: src.spawn === undefined ? DEFAULT_TEXT_LINT.spawn : src.spawn === true,
     maxSamples: num(src.maxSamples, DEFAULT_TEXT_LINT.maxSamples, 0, 20),
     python: str(src.python) || DEFAULT_TEXT_LINT_PYTHON,
-    script: str(src.script) || DEFAULT_TEXT_LINT_SCRIPT,
+    script: str(src.script),
     port: num(src.port, 8791, 1, 65_535),
   };
 
@@ -219,6 +229,16 @@ export function createTextLinter({
     started = true;
     if (!cfg.enabled || !cfg.spawn) return;
     try {
+      // 没有默认脚本路径（2026-11-19）：要 spawn 就必须显式给。
+      // **不猜、不兜底** —— 猜错的形态是"服务起不来但所有计数都正常"，比不起更坏。
+      if (cfg.script === '') {
+        stats.spawnFailed = true;
+        log('warn', '文本判据开了 spawn 但没给 script 路径 ⇒ 本次不起服务（发送不受影响）', {
+          hint: '要插件自己管服务生命周期，必须显式给 config.script 或环境变量 QQ_TEXT_LINT_SCRIPT；'
+            + '只当纯客户端用就保持 spawn:false，由外部起服务。',
+        });
+        return;
+      }
       if (!fs.existsSync(cfg.script)) {
         stats.spawnFailed = true;
         log('warn', '文本判据服务脚本不存在，判据关掉（发送不受影响）', { script: cfg.script });

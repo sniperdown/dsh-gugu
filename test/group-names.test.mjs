@@ -20,7 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  DEFAULT_GROUP_NAME_TABLE_PATH,
+  DEFAULT_GROUP_NAME_DIR,
   createGroupNameCache,
   defaultGroupNameTablePath,
   normalizeGroupNameTable,
@@ -75,11 +75,14 @@ test('defaultGroupNameTablePath：优先 DSH_HOME', () => {
   assert.equal(got, path.join('D:\\fake-home', 'media', 'qq-group-names.json'));
 });
 
-test('defaultGroupNameTablePath：没有 DSH_HOME ⇒ 本部署写死目录（不是空串）', () => {
+test('defaultGroupNameTablePath：没有 DSH_HOME ⇒ 回退到本机默认目录（不是空串）', () => {
   const got = defaultGroupNameTablePath({});
   assert.ok(got.endsWith('qq-group-names.json'));
   assert.ok(got.includes('media'));
-  assert.equal(got, DEFAULT_GROUP_NAME_TABLE_PATH);
+  // ⚠️ 这里**不能**跟 `DEFAULT_GROUP_NAME_TABLE_PATH` 比：那个常量是 import 时按
+  // **本进程的 process.env** 算出来的，而这一步传的是空 env —— 跑测试的机器上有
+  // DSH_HOME 时两边必然不同（曾经因此假红）。要比就跟同一个空 env 推出来的回退路径比。
+  assert.equal(got, path.join(DEFAULT_GROUP_NAME_DIR, 'qq-group-names.json'));
 });
 
 test('normalizeGroupNameTable：空路径 = 明确关掉', () => {

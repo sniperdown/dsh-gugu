@@ -276,8 +276,13 @@ test('★ 端到端：**图片段一个字节都不碰**，只剥文本段', asy
   const url = 'https://gxh.vip.qq.com/club/item/parcel/item/67/aaa/raw300.gif';
   const ok = await h.gateway.speakProactively('group:200000001', '# 看图 **这个**', [url]);
   assert.equal(ok, true);
+  // 文本段是 **data 嵌套**的规范形状：扁平 `{type:'text', text}` 混在段数组里进
+  // `send_msg` 时，NapCat 直接报 `Cannot read properties of undefined (reading 'text')`
+  // （retcode 200），真机实测见 `test/outbound-image.test.mjs` 那条「文本段也是 data 嵌套」。
+  // 这条用例钉的是**剥除不该碰图和段形状**：正文照剥、图段逐字节照搬 ——
+  // 所以断言跟着规范形状走，不是把断言放宽。
   assert.deepEqual(h.transport.sent[0].message, [
-    { type: 'text', text: '看图 这个' },
+    { type: 'text', data: { text: '看图 这个' } },
     { type: 'image', data: { url } },
   ]);
 });

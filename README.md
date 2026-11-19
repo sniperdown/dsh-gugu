@@ -252,6 +252,7 @@ token 与上面的 `accessToken` 一致。消息上报格式建议选「**数组
 | 记忆与关系数据 | `knowledge.json` / `learned-memory.json` / 关系记账里有别人的信息和推断 |
 | 运行日志、台账、信箱 | 属于运行期产物，会随使用不断变化 |
 | 模型权重 | `wav2small` 是 CC-BY-NC-SA-4.0，与 MIT 不兼容（见上一节） |
+| 出站文本判据的 Python 小服务 | `src/dsh/text-lint.mjs` 只是个**客户端**：默认 `spawn:false`，连一个外部起好的服务。想让插件自己起服务必须显式给 `script`（`QQ_TEXT_LINT_SCRIPT`），仓库里不带这个脚本，也没有默认路径 |
 
 `.gitignore` 里每一条都写了理由，照着看即可。
 
